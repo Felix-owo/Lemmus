@@ -1,0 +1,1262 @@
+# RNA/DARLIN 工作流公共配置层：只解析项目输入、reference、read layout 与资源参数。
+# 所有 workflow rule 保持在本文件，Python 业务逻辑按 lemmus 包职责分派。
+
+import csv
+import os
+import re
+import shlex
+import sys
+from pathlib import Path
+
+PIPELINE_ROOT = Path(workflow.basedir).parent.resolve()
+SRC_DIR = PIPELINE_ROOT / "core"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from lemmus.inputs import load_barcode_config
+from lemmus.config import validate_config,select_config
+from lemmus.inputs import map_fastq_pairs_to_manifest, read_manifest, require_fastq_pairs
+from lemmus.config import PROTOCOLS,get_protocol
+from lemmus.inputs import droplet_whitelist_path
+from lemmus.rna import droplet_geometry
+from lemmus.rna import validate_rna_reference
+from lemmus.config import RNA_RESOLUTION as PRODUCTION_RNA_RESOLUTION
+
+validate_config(config)
+config = select_config(config)
+
+RNA_DARLIN_SCHEMA_VERSION = 2
+if config.get("schema_version") != RNA_DARLIN_SCHEMA_VERSION:
+    raise ValueError(
+        "RNA/DARLIN config does not use this release schema "
+        f"(expected schema_version={RNA_DARLIN_SCHEMA_VERSION})"
+    )
+CONFIGURED_PIPELINE_MODE = str(config.get("pipeline_mode", "")).strip().lower()
+REGISTERED_PROTOCOLS = set(PROTOCOLS)
+if CONFIGURED_PIPELINE_MODE not in REGISTERED_PROTOCOLS:
+    raise ValueError("RNA/DARLIN config must explicitly define pipeline_mode")
+
+
+def resolve_data_dir():
+    active = str(os.environ.get("RNA_DARLIN_CONFIG", "")).strip()
+    if active:
+        path = Path(active).expanduser().resolve()
+    else:
+        configfiles = list(getattr(workflow, "configfiles", []) or [])
+        if not configfiles:
+            raise ValueError(
+                "RNA_DARLIN_Pipeline requires --configfile <project>/00_config/config.yaml"
+            )
+        path = Path(configfiles[-1]).expanduser().resolve()
+    if path.name != "config.yaml" or path.parent.name != "00_config":
+        raise ValueError(
+            f"RNA_DARLIN_Pipeline only accepts <project>/00_config/config.yaml; found {path}"
+        )
+    return path.parent.parent.resolve()
+
+
+DATA_DIR = resolve_data_dir()
+
+
+def as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def is_blank(value):
+    return value is None or str(value).strip().lower() in {"", "none", "null", "false"}
+
+
+def shell_args(args):
+    return " ".join(shlex.quote(str(arg)) for arg in args)
+
+
+RNA_CONFIG = config.get("RNA", {})
+DARLIN_CONFIG = config.get("DARLIN", {}) or {}
+QC_CONFIG = config.get("QC", {}) or {}
+PIPELINE_MODE = CONFIGURED_PIPELINE_MODE
+if PIPELINE_MODE not in REGISTERED_PROTOCOLS:
+    raise ValueError(
+        f"Unsupported RNA library-adapter protocol {PIPELINE_MODE!r}; "
+        f"expected one of {sorted(REGISTERED_PROTOCOLS)}"
+    )
+if PIPELINE_MODE != CONFIGURED_PIPELINE_MODE:
+    raise ValueError(
+        "Runner protocol does not match RNA/DARLIN config pipeline_mode "
+        f"({PIPELINE_MODE!r} != {CONFIGURED_PIPELINE_MODE!r})"
+    )
+
+IS_DROPLET = PIPELINE_MODE == "droplet"
+CALLING_ENV = (PIPELINE_ROOT / "conda/calling").resolve()
+PROTOCOL = get_protocol(PIPELINE_MODE)
+RNA_BARCODE_MATE = PROTOCOL.barcode_mate
+RNA_INSERT_MATE = PROTOCOL.insert_mate
+if (RNA_BARCODE_MATE, RNA_INSERT_MATE) not in {("R1", "R2"), ("R2", "R1")}:
+    raise ValueError(
+        "RNA library-adapter route must declare an implemented barcode/insert "
+        f"mate orientation, found barcode={RNA_BARCODE_MATE!r}, "
+        f"insert={RNA_INSERT_MATE!r}"
+    )
+RNA_EXPRESSION_ENABLED = PROTOCOL.expression_enabled
+RULE_ENV_PREFIX = str(os.environ.get("RNA_DARLIN_RULE_ENV", "")).strip()
+DARLIN_ENABLED = as_bool(DARLIN_CONFIG.get("enabled", False))
+DARLIN_INCLUDE_RNA_FASTQ = as_bool(DARLIN_CONFIG.get("include_rna_fastq", False))
+if DARLIN_ENABLED and not PROTOCOL.darlin_enabled:
+    raise ValueError(
+        f"Protocol={PIPELINE_MODE!r} has no DARLIN route; "
+        "disable DARLIN or select a protocol that declares one"
+    )
+# quant_threads 是显式可见的配置项：simpleaf quant 的线程预算默认等于
+# RNA.cores（行为不变）；刻意调低（如 piscem 实测 map_threads=12 时设 13）
+# 可以让单线程 DARLIN 提取与 RNA 定量在同一 core 预算内并行。
+RNA_QUANT_THREADS = int(RNA_CONFIG.get("quant_threads") or RNA_CONFIG.get("cores", 16))
+RNA_RUNTIME_MIN = int(RNA_CONFIG.get("runtime", 720))
+RNA_MEM_MB = int(RNA_CONFIG.get("mem_mb", 16384))
+RNA_MIN_READS = int(RNA_CONFIG.get("min_reads", 1 if IS_DROPLET else 10))
+RNA_RESOLUTION = str(RNA_CONFIG.get("resolution", PRODUCTION_RNA_RESOLUTION)).strip()
+if RNA_RESOLUTION != PRODUCTION_RNA_RESOLUTION:
+    raise ValueError("RNA.resolution must be parsimony-gene")
+RNA_EXPECTED_ORI = str(RNA_CONFIG.get("expected_orientation", "rc" if IS_DROPLET else "both")).strip()
+if RNA_EXPECTED_ORI not in {"fw", "rc", "both"}:
+    raise ValueError("RNA.expected_orientation must be fw, rc, or both")
+DOUBLE_CELL_CONFIG = QC_CONFIG.get("double_cell", {}) or {}
+DOUBLE_CELL_ENABLED = as_bool(DOUBLE_CELL_CONFIG.get("enabled", True))
+READ_FATE_CONFIG = QC_CONFIG.get("read_fate", {}) or {}
+READ_FATE_ENABLED = as_bool(READ_FATE_CONFIG.get("enabled", False))
+
+
+def resolve_project_path(value):
+    path = Path(value)
+    if not path.is_absolute():
+        path = DATA_DIR / path
+    return path.resolve()
+
+
+PATH_CONFIG = config.get("paths", {}) or {}
+WORK_ROOT = resolve_project_path(PATH_CONFIG.get("work_root", "02_work"))
+RESULTS_ROOT = resolve_project_path(PATH_CONFIG.get("results_root", "03_results"))
+LOGS_ROOT = resolve_project_path(PATH_CONFIG.get("logs_root", "04_logs"))
+
+
+def resolve_sample_manifest_path():
+    raw = config.get("sample_manifest", "00_config/sample_manifest.tsv")
+    raw = str(raw).strip()
+    if not raw or raw.lower() in {"none", "false", "null"}:
+        raise ValueError("sample_manifest must point to 00_config/sample_manifest.tsv")
+
+    path = Path(raw)
+    path = path if path.is_absolute() else DATA_DIR / path
+    if not path.is_file():
+        raise ValueError(f"Sample manifest does not exist: {path}")
+    return path.resolve()
+
+
+def resolve_barcode_map_path():
+    raw = config.get("barcode_map", "00_config/Barcode_Map.csv")
+    path = Path(str(raw)).expanduser()
+    path = path if path.is_absolute() else DATA_DIR / path
+    if not path.is_file():
+        raise ValueError(f"Project Barcode_Map.csv does not exist: {path}")
+    return path.resolve()
+
+
+SAMPLE_MANIFEST_PATH = resolve_sample_manifest_path()
+_, SAMPLE_MANIFEST = read_manifest(SAMPLE_MANIFEST_PATH)
+if not SAMPLE_MANIFEST:
+    raise ValueError(f"Sample manifest contains no sample rows: {SAMPLE_MANIFEST_PATH}")
+BARCODE_MAP = None if IS_DROPLET else resolve_barcode_map_path()
+RNA_BARCODE_CONFIG = None if IS_DROPLET else load_barcode_config(BARCODE_MAP, require_rna=True)
+RNA_BARCODE_LENGTH = 17 if IS_DROPLET else RNA_BARCODE_CONFIG.rna_audit.lengths[0]
+RNA_UMI_LENGTH = 12 if IS_DROPLET else 8
+WHITELIST_SOURCE = droplet_whitelist_path() if IS_DROPLET else BARCODE_MAP
+
+
+def require_sample_id(row):
+    sample_id = str(row["sample_id"]).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", sample_id):
+        raise ValueError(
+            "sample_manifest.tsv sample_id contains unsupported characters for Snakemake wildcards: "
+            f"{sample_id!r}. Use only letters, numbers, underscore, dot, and dash."
+        )
+    return sample_id
+
+
+def manifest_sample_ids(column):
+    sample_ids = []
+    seen = {}
+    for row in SAMPLE_MANIFEST:
+        raw_sample = row.get(column, "")
+        if not raw_sample:
+            continue
+        sample_id = require_sample_id(row)
+        previous = seen.get(sample_id)
+        if previous and previous != raw_sample:
+            raise ValueError(
+                f"Duplicate sample_id {sample_id!r} would collide for {column} FASTQs: "
+                f"{previous!r} and {raw_sample!r}"
+            )
+        if sample_id not in seen:
+            sample_ids.append(sample_id)
+            seen[sample_id] = raw_sample
+    return sample_ids
+
+
+RNA_RAW_DIR = resolve_project_path(config.get("raw_data_dir", "01_raw/RNA"))
+RNA_RAW_FASTQ_PAIRS = require_fastq_pairs(
+    RNA_RAW_DIR, "RNA", allow_empty=DARLIN_ENABLED
+)
+RNA_FASTQ_PAIRS = (
+    map_fastq_pairs_to_manifest(
+        RNA_RAW_FASTQ_PAIRS,
+        SAMPLE_MANIFEST,
+        column="rna_sample",
+        label="RNA",
+    )
+    if RNA_RAW_FASTQ_PAIRS or any(row.get("rna_sample") for row in SAMPLE_MANIFEST)
+    else {}
+)
+
+
+def discover_samples():
+    if not RNA_FASTQ_PAIRS and DARLIN_ENABLED:
+        return []
+    samples = manifest_sample_ids("rna_sample")
+
+    if not samples:
+        if DARLIN_ENABLED:
+            return []
+        raise ValueError("No RNA samples found")
+
+    missing = [sample for sample in samples if sample not in RNA_FASTQ_PAIRS]
+    if missing:
+        raise ValueError(
+            "Configured RNA samples are missing paired FASTQ files: "
+            + ", ".join(missing)
+            + ". Update sample_manifest.tsv or raw_data_dir."
+        )
+
+    return samples
+
+
+RNA_SAMPLES = discover_samples()
+
+MANIFEST_BY_SAMPLE_ID = {require_sample_id(row): row for row in SAMPLE_MANIFEST}
+
+
+REFERENCE_SPECIES = str(RNA_CONFIG.get("reference", "mm10")).strip()
+REFERENCE_DIR = (PIPELINE_ROOT / "resources" / f"{REFERENCE_SPECIES}_reference" / "pg45s").resolve()
+GENOME_FASTA = REFERENCE_DIR / "genome.fa"
+GTF_FILE = REFERENCE_DIR / "genes" / "genes.gtf"
+SIMPLEAF_REFERENCE = REFERENCE_DIR / "simpleaf"
+SIMPLEAF_INDEX = SIMPLEAF_REFERENCE / "index"
+# Use the 2-column map for the standard gene-by-cell matrix. The 3-column map
+# activates USA mode, which intentionally changes the output feature space.
+SIMPLEAF_T2G = SIMPLEAF_REFERENCE / "ref" / "t2g.tsv"
+
+def validate_reference_inputs():
+    validate_rna_reference(REFERENCE_DIR, REFERENCE_SPECIES)
+
+if RNA_EXPRESSION_ENABLED:
+    validate_reference_inputs()
+
+LOG_DIR = LOGS_ROOT / "rna_core"
+WORK_DIR = WORK_ROOT / "rna_core"
+COUNT_DIR = RESULTS_ROOT / "count"
+QUANT_DIR = WORK_DIR / "droplet_quant" if IS_DROPLET else COUNT_DIR
+DROPLET_DIR = WORK_ROOT / "droplet"
+RNA_DARLIN_FASTQ_DIR = WORK_DIR / "rna_darlin_fastq"
+RNA_DARLIN_PREFILTER_DIR = LOG_DIR / "darlin_rna_prefilter"
+
+shell.prefix("set -euo pipefail; ")
+
+
+def fastq_r1(wildcards):
+    return RNA_FASTQ_PAIRS[wildcards.sample]["R1"]
+
+
+def fastq_r2(wildcards):
+    return RNA_FASTQ_PAIRS[wildcards.sample]["R2"]
+
+
+def input_read_for_mate(mate):
+    if mate not in {"R1", "R2"}:
+        raise ValueError(f"Unsupported FASTQ mate in RNA adapter contract: {mate!r}")
+
+    def _input_read(wildcards):
+        return fastq_r1(wildcards) if mate == "R1" else fastq_r2(wildcards)
+
+    return _input_read
+
+
+def darlin_output_targets():
+    if not DARLIN_ENABLED:
+        return []
+    return [str(RESULTS_ROOT / "DARLIN" / "DARLIN_clone_id" / "DARLIN_Clone_ID.csv")]
+
+
+DARLIN_FINAL_OUTPUTS = darlin_output_targets()
+
+RNA_EXPRESSION_TARGETS = (
+    expand(str(COUNT_DIR / "{sample}" / "RNA.h5ad"), sample=RNA_SAMPLES)
+    if RNA_EXPRESSION_ENABLED
+    else []
+)
+RNA_TARGETS = RNA_EXPRESSION_TARGETS
+
+DEFAULT_DARLIN_TEMPLATES = ["Tigre_2022_v2", "Rosa_v2", "cCARLIN"]
+DARLIN_TEMPLATES = as_list(DARLIN_CONFIG.get("template", DEFAULT_DARLIN_TEMPLATES))
+DARLIN_WORK_DIR = WORK_ROOT / "darlin"
+DARLIN_MERGED_EVIDENCE_OUTPUTS = (
+    [
+        *expand(
+            str(DARLIN_WORK_DIR / "{template}" / "DARLIN_Barcodes.csv.gz"),
+            template=DARLIN_TEMPLATES,
+        ),
+        *expand(
+            str(DARLIN_WORK_DIR / "{template}" / "DARLIN_Barcodes.csv.gz.sha256"),
+            template=DARLIN_TEMPLATES,
+        ),
+    ]
+    if DARLIN_ENABLED
+    else []
+)
+
+RNA_QC_DIR = RESULTS_ROOT / "QC_Results"
+RNA_FASTQC_DIR = LOGS_ROOT / "fastqc" / "raw_reads"
+RNA_FASTQC_LINK_DIR = WORK_ROOT / "fastqc_raw_reads"
+RNA_CELL_QC_SUMMARY_DIR = LOGS_ROOT / "cell_qc"
+READ_FATE_WORK_DIR = WORK_ROOT / "read_fate"
+READ_FATE_TSV = RNA_QC_DIR / "read_fate.tsv"
+READ_FATE_SUMMARY = RNA_QC_DIR / "read_fate.summary.json"
+READ_FATE_CHECKSUM = RNA_QC_DIR / "read_fate.tsv.sha256"
+RNA_DARLIN_READ_FATE_OUTPUTS = [READ_FATE_TSV, READ_FATE_SUMMARY, READ_FATE_CHECKSUM]
+RNA_DARLIN_DEFAULT_READ_FATE_OUTPUTS = RNA_DARLIN_READ_FATE_OUTPUTS if READ_FATE_ENABLED else []
+
+RNA_FASTQC_OUTPUTS = (
+    expand(str(RNA_FASTQC_DIR / "{sample}_{read}_fastqc.zip"), sample=RNA_SAMPLES, read=["R1", "R2"])
+    if RNA_SAMPLES
+    else []
+)
+
+MULTIQC_CUSTOM_DIR = WORK_ROOT / "multiqc_custom"
+MULTIQC_REPORT = RNA_QC_DIR / "multiqc_report.html"
+MULTIQC_DATA_DIR = RNA_QC_DIR / "multiqc_data"
+RNA_SIMPLEAF_MAP_INFOS = expand(
+    str(QUANT_DIR / "{sample}" / "af_map" / "map_info.json"), sample=RNA_SAMPLES
+)
+RNA_SIMPLEAF_QUANT_JSONS = expand(
+    str(QUANT_DIR / "{sample}" / "af_quant" / "quant.json"), sample=RNA_SAMPLES
+)
+
+DARLIN_PREFILTER_METRICS = []
+DARLIN_BARCODE_METRICS = []
+RNA_NATIVE_QC_TARGETS = RNA_FASTQC_OUTPUTS + DARLIN_PREFILTER_METRICS + [str(MULTIQC_REPORT), str(MULTIQC_DATA_DIR)]
+
+
+wildcard_constraints:
+    template="[^/]+",
+    sample="[^/]+"
+
+# 默认目标：汇总 RNA count、DARLIN clone table 与 QC 输出。
+rule all:
+    input:
+        RNA_TARGETS + DARLIN_FINAL_OUTPUTS + DARLIN_MERGED_EVIDENCE_OUTPUTS + RNA_NATIVE_QC_TARGETS + RNA_DARLIN_DEFAULT_READ_FATE_OUTPUTS
+
+# Read-fate is an expensive full-FASTQ audit. Keep it available as an explicit
+# target without forcing a second complete FASTQ pass in normal production runs.
+rule read_fate_audit:
+    input:
+        RNA_DARLIN_READ_FATE_OUTPUTS
+
+
+# RNA 计算层：标准 3' scRNA-seq，simpleaf 统一驱动 piscem mapping 与 alevin-fry quantification。
+
+
+rule write_rna_whitelist:
+    input:
+        source=str(WHITELIST_SOURCE)
+    output:
+        whitelist=str(WORK_ROOT / "barcode_config" / "RNA_barcode_permit_list.txt")
+    log:
+        str(LOGS_ROOT / "barcode_config" / "write_rna_whitelist.log")
+    params:
+        source_flag="--design-whitelist" if IS_DROPLET else "--barcode-map"
+    shell:
+        """
+        mkdir -p "$(dirname {output.whitelist:q})" "$(dirname {log:q})"
+        python -m lemmus write-rna-whitelist \
+            {params.source_flag} {input.source:q} \
+            --output {output.whitelist:q} \
+            > {log:q} 2>&1
+        """
+
+
+def rna_geometry():
+    if IS_DROPLET:
+        return droplet_geometry()
+    # Cabernet 3' scRNA-seq: biological cDNA is R1; CB+UMI are at the 5' end of R2.
+    if (RNA_INSERT_MATE, RNA_BARCODE_MATE) != ("R1", "R2"):
+        raise ValueError("Current standard 3' RNA route requires R1=cDNA and R2=CB+UMI")
+    return f"1{{r:}}2{{b[{RNA_BARCODE_LENGTH}]u[{RNA_UMI_LENGTH}]x:}}"
+
+
+rule preprocess_droplet_rna:
+    """按官方 DD-MET5 次序修剪 R2，保留 R1 条码和 UMI，核对配对守恒。"""
+    input:
+        r1=fastq_r1,
+        r2=fastq_r2
+    output:
+        r1=temp(str(DROPLET_DIR / "{sample}" / "R1.fq.gz")),
+        r2=temp(str(DROPLET_DIR / "{sample}" / "R2.fq.gz")),
+        qc=str(DROPLET_DIR / "{sample}" / "preprocess.json")
+    log:
+        str(LOG_DIR / "{sample}.droplet_preprocess.log")
+    threads: 2
+    resources:
+        mem_mb=1024,
+        runtime=RNA_RUNTIME_MIN
+    params:
+        python=str(CALLING_ENV / "bin/python")
+    shell:
+        """
+        mkdir -p "$(dirname {log:q})"
+        {params.python:q} -m lemmus preprocess-droplet-rna \
+          --r1 {input.r1:q} --r2 {input.r2:q} \
+          --output-r1 {output.r1:q} --output-r2 {output.r2:q} --qc {output.qc:q} > {log:q} 2>&1
+        """
+
+
+def quant_r1(wildcards):
+    return str(DROPLET_DIR / wildcards.sample / "R1.fq.gz") if IS_DROPLET else fastq_r1(wildcards)
+
+
+def quant_r2(wildcards):
+    return str(DROPLET_DIR / wildcards.sample / "R2.fq.gz") if IS_DROPLET else fastq_r2(wildcards)
+
+
+rule simpleaf_quant:
+    input:
+        r1=quant_r1,
+        r2=quant_r2,
+        whitelist=rules.write_rna_whitelist.output.whitelist,
+        t2g=str(SIMPLEAF_T2G),
+        competitor=str(SIMPLEAF_REFERENCE / "ref" / "rrna_competitor.json")
+    output:
+        h5ad=temp(str(QUANT_DIR / "{sample}" / "af_quant" / "alevin" / "quants.h5ad")),
+        quant_json=str(QUANT_DIR / "{sample}" / "af_quant" / "quant.json"),
+        map_info=str(QUANT_DIR / "{sample}" / "af_map" / "map_info.json"),
+        permit_qc=str(QUANT_DIR / "{sample}" / "af_quant" / "generate_permit_list.json") if IS_DROPLET else [],
+        scratch=temp([str(QUANT_DIR / "{sample}" / p) for p in (
+            "af_map/map.rad", "af_map/unmapped_bc_count.bin", "af_quant/map.collated.rad",
+            "af_quant/correction_plan.bin", "af_quant/permit_freq.bin", "af_quant/permit_map.bin",
+            "af_quant/unmapped_bc_count_collated.bin")] if IS_DROPLET else [])
+    log:
+        str(LOG_DIR / "{sample}.simpleaf_quant.log")
+    threads: RNA_QUANT_THREADS
+    resources:
+        mem_mb=RNA_MEM_MB,
+        runtime=RNA_RUNTIME_MIN
+    params:
+        index=str(SIMPLEAF_INDEX),
+        chemistry=rna_geometry(),
+        resolution=RNA_RESOLUTION,
+        expected_ori=RNA_EXPECTED_ORI,
+        min_reads=RNA_MIN_READS,
+        output_dir=lambda wildcards: str(QUANT_DIR / wildcards.sample),
+        small_thresh="--small-thresh 0" if IS_DROPLET else "",
+    shell:
+        """
+        mkdir -p {params.output_dir:q} "$(dirname {log:q})"
+        ulimit -n 2048 || true
+        simpleaf quant \
+            --index {params.index:q} \
+            --reads1 {input.r1:q} \
+            --reads2 {input.r2:q} \
+            --chemistry {params.chemistry:q} \
+            --unfiltered-pl {input.whitelist:q} \
+            --min-reads {params.min_reads} \
+            --expected-ori {params.expected_ori:q} \
+            --cell-bc-correction unique \
+            --cell-bc-neighborhood hamming-1 \
+            --t2g-map {input.t2g:q} \
+            --resolution {params.resolution:q} {params.small_thresh} \
+            --threads {threads} \
+            --anndata-out \
+            --output {params.output_dir:q} \
+            >> {log:q} 2>&1
+        test -s {output.h5ad:q}
+        test -s {output.quant_json:q}
+        test -s {output.map_info:q}
+        """
+
+
+rule prepare_rna_counts:
+    """保存45S技术计数，并为调用及下游发布纯生物gene矩阵。"""
+    input:
+        h5ad=rules.simpleaf_quant.output.h5ad,
+        quant_json=rules.simpleaf_quant.output.quant_json,
+        competitor=str(SIMPLEAF_REFERENCE / "ref" / "rrna_competitor.json")
+    output:
+        h5ad=str(QUANT_DIR / "{sample}" / "af_quant" / "alevin" / "biological.h5ad")
+    log:
+        str(LOG_DIR / "{sample}.prepare_rna_counts.log")
+    resources:
+        mem_mb=RNA_MEM_MB,
+        runtime=30
+    params:
+        reference=str(REFERENCE_DIR),
+        species=REFERENCE_SPECIES
+    shell:
+        """
+        python -m lemmus prepare-rna-counts \
+          --input {input.h5ad:q} --quant-json {input.quant_json:q} \
+          --reference {params.reference:q} --species {params.species:q} \
+          --output {output.h5ad:q} > {log:q} 2>&1
+        """
+
+
+def rna_raw_sample(wildcards):
+    return str(MANIFEST_BY_SAMPLE_ID[wildcards.sample]["rna_sample"])
+
+
+rule call_droplet_rna:
+    """以完整背景矩阵独立调用 RNA 细胞，临时检验不覆盖原生分子矩阵。"""
+    input:
+        quants=rules.prepare_rna_counts.output.h5ad
+    output:
+        calls=str(DROPLET_DIR / "{sample}" / "calling.tsv"),
+        qc=str(DROPLET_DIR / "{sample}" / "calling.json")
+    log:
+        str(LOG_DIR / "{sample}.emptydrops.log")
+    resources:
+        mem_mb=RNA_MEM_MB,
+        runtime=RNA_RUNTIME_MIN
+    params:
+        rscript=str(CALLING_ENV / "bin/Rscript")
+    shell:
+        """
+        mkdir -p "$(dirname {log:q})"
+        python -m lemmus call-droplet-rna \
+          --input {input.quants:q} --calls {output.calls:q} --qc {output.qc:q} \
+          --rscript {params.rscript:q} > {log:q} 2>&1
+        """
+
+
+def finalize_protocol_args(wildcards):
+    if IS_DROPLET:
+        folder = DROPLET_DIR / wildcards.sample
+        return shell_args(["--protocol", "droplet", "--calls", folder / "calling.tsv",
+                           "--calling-qc", folder / "calling.json", "--preprocess-qc", folder / "preprocess.json",
+                           "--permit-qc", QUANT_DIR / wildcards.sample / "af_quant/generate_permit_list.json",
+                           "--map-info", QUANT_DIR / wildcards.sample / "af_map/map_info.json"])
+    return shell_args(["--protocol", "cabernet", "--barcode-map", BARCODE_MAP])
+
+
+rule finalize_rna_h5ad:
+    """发布稳定 RNA 细胞身份和未取整的表达矩阵，记录独立调用与 QC。"""
+    input:
+        quants=rules.prepare_rna_counts.output.h5ad,
+        barcode_map=[] if IS_DROPLET else [str(BARCODE_MAP)],
+        calls=str(DROPLET_DIR / "{sample}" / "calling.tsv") if IS_DROPLET else [],
+        calling_qc=str(DROPLET_DIR / "{sample}" / "calling.json") if IS_DROPLET else [],
+        preprocess_qc=str(DROPLET_DIR / "{sample}" / "preprocess.json") if IS_DROPLET else [],
+        permit_qc=rules.simpleaf_quant.output.permit_qc,
+        map_info=rules.simpleaf_quant.output.map_info if IS_DROPLET else [],
+        manifest=str(SAMPLE_MANIFEST_PATH)
+    output:
+        h5ad=str(COUNT_DIR / "{sample}" / "RNA.h5ad")
+    log:
+        str(LOG_DIR / "{sample}.finalize_rna_h5ad.log")
+    resources:
+        mem_mb=RNA_MEM_MB if IS_DROPLET else 4096,
+        runtime=30
+    params:
+        rna_sample=rna_raw_sample,
+        protocol_args=finalize_protocol_args
+    shell:
+        """
+        mkdir -p "$(dirname {output.h5ad:q})" "$(dirname {log:q})"
+        python -m lemmus finalize-rna-h5ad \
+            --input {input.quants:q} \
+            --output {output.h5ad:q} \
+            {params.protocol_args} \
+            --sample-id {wildcards.sample:q} \
+            --rna-sample {params.rna_sample:q} \
+            > {log:q} 2>&1
+        test -s {output.h5ad:q}
+        """
+
+
+rule prefilter_rna_darlin_fastq:
+    input:
+        r1=fastq_r1,
+        r2=fastq_r2
+    output:
+        r1=temp(str(RNA_DARLIN_FASTQ_DIR / "{sample}_R1.fastq.gz")),
+        r2=temp(str(RNA_DARLIN_FASTQ_DIR / "{sample}_R2.fastq.gz")),
+        metrics=temp(str(RNA_DARLIN_PREFILTER_DIR / "{sample}.prefilter.tsv"))
+    log:
+        str(LOG_DIR / "darlin" / "{sample}.rna_darlin_prefilter.log")
+    resources:
+        mem_mb=4096,
+        runtime=120
+    params:
+        command="prefilter-rna-darlin"
+    shell:
+        """
+        mkdir -p "$(dirname {output.r1:q})" "$(dirname {output.metrics:q})" "$(dirname {log:q})"
+        python -m lemmus {params.command:q} \
+            --input-r1 {input.r1:q} \
+            --input-r2 {input.r2:q} \
+            --output-r1 {output.r1:q} \
+            --output-r2 {output.r2:q} \
+            --metrics {output.metrics:q} \
+            --sample {wildcards.sample:q} \
+            > {log:q} 2>&1
+        """
+# DARLIN 计算层：提取 barcode、运行 clone 调用并构建最终 clone 表。
+if DARLIN_ENABLED:
+    # 单一来源：DARLIN 提取默认值与 template->locus 映射直接取自
+    # lemmus.config.DEFAULT_EXTRACTION / lemmus.darlin.DEFAULT_TEMPLATE_LOCUS，
+    # 禁止在本文件维护第二份默认值副本。
+    from lemmus.config import DEFAULT_EXTRACTION
+    from lemmus.darlin import DEFAULT_TEMPLATE_LOCUS
+
+    DEFAULT_DARLIN_EXTRACTION = dict(DEFAULT_EXTRACTION)
+    DEFAULT_DARLIN_TEMPLATE_LOCUS = dict(DEFAULT_TEMPLATE_LOCUS)
+    def discover_darlin_raw_fastq_pairs():
+        return require_fastq_pairs(
+            resolve_project_path(DARLIN_CONFIG.get("fastq_dir") or "01_raw/DARLIN"),
+            "DARLIN",
+            allow_empty=DARLIN_INCLUDE_RNA_FASTQ,
+        )
+
+    def rna_derived_darlin_sample(sample):
+        return f"{sample}__RNA"
+
+    def build_darlin_fastq_pairs(raw_pairs, rna_samples):
+        combined = dict(raw_pairs)
+        if DARLIN_INCLUDE_RNA_FASTQ:
+            for sample in rna_samples:
+                derived_sample = rna_derived_darlin_sample(sample)
+                if derived_sample in combined:
+                    raise ValueError(
+                        f"RNA-derived DARLIN sample name conflicts with raw DARLIN sample: {derived_sample}"
+                    )
+                combined[derived_sample] = {
+                    "R1": str(RNA_DARLIN_FASTQ_DIR / f"{sample}_R1.fastq.gz"),
+                    "R2": str(RNA_DARLIN_FASTQ_DIR / f"{sample}_R2.fastq.gz"),
+                }
+
+        if not combined:
+            raise ValueError(
+                "No paired DARLIN input FASTQ files were discovered. "
+                "Set DARLIN.fastq_dir or disable DARLIN."
+            )
+        return combined
+
+    def resolve_darlin_sample_list(discovered_pairs):
+        sample_list = manifest_sample_ids("darlin_sample")
+        missing = [sample for sample in sample_list if sample not in discovered_pairs]
+        if missing:
+            raise ValueError(
+                "DARLIN samples listed in sample_manifest.tsv are missing paired FASTQ files: "
+                + ", ".join(missing)
+            )
+        return sample_list
+
+    def load_manifest_darlin_pairing():
+        mapping = {}
+
+        for index, row in enumerate(SAMPLE_MANIFEST):
+            rna_sample = row.get("rna_sample", "")
+            darlin_sample = row.get("darlin_sample", "")
+            if not (rna_sample and darlin_sample):
+                continue
+            sample_id = require_sample_id(row)
+            rna_sample = sample_id
+            darlin_sample = sample_id
+            previous = mapping.get(rna_sample)
+            if previous and previous != darlin_sample:
+                raise ValueError(
+                    f"Conflicting DARLIN mapping for RNA sample {rna_sample}: "
+                    f"{previous} vs {darlin_sample} in sample_manifest.tsv[{index}]"
+                )
+            mapping[rna_sample] = darlin_sample
+
+        return mapping
+
+    def pair_darlin_with_rna_samples(rna_samples, darlin_samples):
+        rna_set = set(rna_samples)
+        darlin_set = set(darlin_samples)
+        mapping = load_manifest_darlin_pairing()
+        invalid = []
+
+        for rna_sample, darlin_sample in mapping.items():
+            if rna_sample not in rna_set:
+                invalid.append(f"{rna_sample} is not a discovered RNA sample")
+            if darlin_sample not in darlin_set:
+                invalid.append(f"{darlin_sample} is not a discovered DARLIN sample")
+
+        used_darlin = {}
+        for rna_sample, darlin_sample in mapping.items():
+            previous = used_darlin.get(darlin_sample)
+            if previous and previous != rna_sample:
+                invalid.append(
+                    f"DARLIN sample {darlin_sample} is mapped to both "
+                    f"{previous} and {rna_sample}"
+                )
+            used_darlin[darlin_sample] = rna_sample
+
+        unmatched = sorted(rna_set.difference(mapping))
+        require_all = as_bool(DARLIN_CONFIG.get("require_all_rna_samples", False))
+        if invalid or (require_all and unmatched):
+            details = invalid
+            if require_all and unmatched:
+                details.append("RNA samples without explicit DARLIN mapping: " + ", ".join(unmatched))
+            raise ValueError(
+                "Invalid RNA/DARLIN relationships in sample_manifest.tsv: " + "; ".join(details)
+            )
+
+        return {
+            rna_sample: darlin_sample
+            for rna_sample, darlin_sample in mapping.items()
+            if rna_sample in rna_set and darlin_sample in darlin_set
+        }
+
+    def build_darlin_run_pairs(rna_pairing, darlin_samples, rna_derived_samples):
+        run_map = dict(rna_pairing)
+        used_darlin = set(run_map.values())
+        for darlin_sample in darlin_samples:
+            if darlin_sample not in used_darlin:
+                run_map[darlin_sample] = darlin_sample
+        if DARLIN_INCLUDE_RNA_FASTQ:
+            for rna_sample in rna_derived_samples:
+                derived_sample = rna_derived_darlin_sample(rna_sample)
+                if derived_sample in run_map:
+                    raise ValueError(
+                        f"RNA-derived DARLIN sample name conflicts with another DARLIN sample: {derived_sample}"
+                    )
+                run_map[derived_sample] = derived_sample
+        return run_map
+
+    DARLIN_EXTRACTION = dict(DEFAULT_DARLIN_EXTRACTION)
+    DARLIN_EXTRACTION.update(DARLIN_CONFIG.get("extraction", {}) or {})
+    DARLIN_TEMPLATE_LOCUS = dict(DEFAULT_DARLIN_TEMPLATE_LOCUS)
+    DARLIN_TEMPLATE_LOCUS.update(DARLIN_CONFIG.get("template_locus", {}) or {})
+
+    # Streaming extraction memory scales with read count, not full retention:
+    # the 2026-09-03 benchmark (docs/BENCHMARK_20260903.md) measured 4.07 GiB
+    # peak RSS for a 4.89M-read library (~0.85 KB/read) after the bounded-
+    # streaming rewrite; the pre-rewrite code peaked at 12.7 GB on the same
+    # class of data.  8192 MB covers ~9.5M reads with headroom; re-benchmark
+    # before lowering further or before running much larger libraries.
+    DARLIN_MEM_MB = int(DARLIN_CONFIG.get("mem_mb", 8192))
+    DARLIN_TIME_MIN = int(DARLIN_CONFIG.get("runtime", 240))
+    DARLIN_PYTHON = "python"
+    DARLIN_DISCOVERED_FASTQ_PAIRS = discover_darlin_raw_fastq_pairs()
+    DARLIN_RAW_FASTQ_PAIRS = (
+        map_fastq_pairs_to_manifest(
+            DARLIN_DISCOVERED_FASTQ_PAIRS,
+            SAMPLE_MANIFEST,
+            column="darlin_sample",
+            label="DARLIN",
+        )
+        if DARLIN_DISCOVERED_FASTQ_PAIRS
+        else {}
+    )
+    DARLIN_AVAILABLE_SAMPLE_LIST = resolve_darlin_sample_list(DARLIN_RAW_FASTQ_PAIRS)
+    DARLIN_RNA_PAIRING = pair_darlin_with_rna_samples(
+        RNA_SAMPLES,
+        DARLIN_AVAILABLE_SAMPLE_LIST,
+    )
+    DARLIN_RNA_DERIVED_SAMPLES = sorted(DARLIN_RNA_PAIRING)
+    DARLIN_FASTQ_PAIRS = build_darlin_fastq_pairs(
+        DARLIN_RAW_FASTQ_PAIRS,
+        DARLIN_RNA_DERIVED_SAMPLES,
+    )
+    DARLIN_RUN_PAIRS = build_darlin_run_pairs(
+        DARLIN_RNA_PAIRING,
+        DARLIN_AVAILABLE_SAMPLE_LIST,
+        DARLIN_RNA_DERIVED_SAMPLES,
+    )
+    DARLIN_SAMPLE_LIST = list(DARLIN_RUN_PAIRS)
+
+    try:
+        CONFIGFILE_PATH = (
+            str(Path(workflow.configfiles[0]).resolve())
+            if getattr(workflow, "configfiles", None)
+            else "config.yaml"
+        )
+    except NameError:
+        CONFIGFILE_PATH = "config.yaml"
+
+    def darlin_locus_for_template(template):
+        for prefix, locus in DARLIN_TEMPLATE_LOCUS.items():
+            if template.startswith(prefix):
+                return locus
+        return template
+
+    def darlin_fastq(read):
+        def _darlin_fastq(wildcards):
+            darlin_sample = DARLIN_RUN_PAIRS[wildcards.sample]
+            return DARLIN_FASTQ_PAIRS[darlin_sample][read]
+
+        return _darlin_fastq
+
+    def darlin_read_cutoff_for_sample(sample):
+        if str(sample).endswith("__RNA"):
+            return DARLIN_EXTRACTION.get("rna_rescue_read_cutoff", 1)
+        read_setting = DARLIN_EXTRACTION.get("read_cutoff", 3)
+        if isinstance(read_setting, str) and read_setting.lower().endswith(".csv"):
+            darlin_sample = DARLIN_RUN_PAIRS.get(sample, sample)
+            allowed_samples = {sample, darlin_sample}
+            cutoff_path = resolve_project_path(read_setting)
+            with open(cutoff_path, encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                if tuple(reader.fieldnames or ()) != ("sample", "read_cutoff"):
+                    raise ValueError(
+                        "DARLIN read_cutoff CSV must have exactly the columns "
+                        "sample,read_cutoff"
+                    )
+                for row in reader:
+                    if row.get("sample") in allowed_samples:
+                        return row["read_cutoff"]
+            raise ValueError(
+                f"No read_cutoff found for RNA sample {sample} or DARLIN sample "
+                f"{darlin_sample} in {cutoff_path}"
+            )
+        return read_setting
+
+    DARLIN_BARCODE_METRICS = expand(
+        str(DARLIN_WORK_DIR / "barcode_qc" / "{sample}.tsv"),
+        sample=DARLIN_SAMPLE_LIST,
+    )
+
+    rule extract_darlin_barcodes:
+        input:
+            fq_R1=darlin_fastq("R1"),
+            fq_R2=darlin_fastq("R2"),
+            whitelist=rules.write_rna_whitelist.output.whitelist
+        output:
+            csv=expand(
+                str(DARLIN_WORK_DIR / "{template}" / "{{sample}}" / "DARLIN_Barcodes.csv"),
+                template=DARLIN_TEMPLATES,
+            ),
+            read_fate=expand(
+                str(DARLIN_WORK_DIR / "{template}" / "{{sample}}" / "read_fate.tsv.gz"),
+                template=DARLIN_TEMPLATES,
+            ),
+            barcode_metrics=str(DARLIN_WORK_DIR / "barcode_qc" / "{sample}.tsv")
+        log:
+            str(LOG_DIR / "darlin" / "{sample}.extract_multi.log")
+        resources:
+            mem_mb=DARLIN_MEM_MB,
+            runtime=DARLIN_TIME_MIN
+        params:
+            python=DARLIN_PYTHON,
+            work_dir=lambda wildcards: str(DARLIN_WORK_DIR / "stream" / wildcards.sample),
+            output_root=str(DARLIN_WORK_DIR),
+            template_args=" ".join(f"--template {shlex.quote(template)}" for template in DARLIN_TEMPLATES),
+            cell_barcode_length=RNA_BARCODE_LENGTH,
+            umi_length=RNA_UMI_LENGTH,
+            chunk_size=str(DARLIN_EXTRACTION["chunk_size"]),
+            min_reads_per_allele_group=str(DARLIN_EXTRACTION["min_reads_per_allele_group"]),
+            seq_5prime_max_edits=str(DARLIN_EXTRACTION["seq_5prime_max_edits"]),
+            seq_3prime_upper_n=str(DARLIN_EXTRACTION["seq_3prime_upper_n"]),
+            seq_3prime_max_mismatches=str(DARLIN_EXTRACTION["seq_3prime_max_mismatches"]),
+            min_cell_read_fraction=str(DARLIN_EXTRACTION["min_cell_read_fraction"]),
+            read_cutoff=lambda wildcards: str(darlin_read_cutoff_for_sample(wildcards.sample))
+        shell:
+            """
+            mkdir -p {params.output_root:q} "$(dirname {output.barcode_metrics:q})" "$(dirname {log:q})"
+            # 廉价前置门禁：损坏/截断的 FASTQ 在数秒内失败，而不是在数小时的提取中途失败。
+            {params.python:q} -m lemmus assert-fastq {input.fq_R1:q} "DARLIN R1" > /dev/null
+            {params.python:q} -m lemmus assert-fastq {input.fq_R2:q} "DARLIN R2" > /dev/null
+            {params.python:q} -m lemmus extract-barcodes-multi \
+                --sample {wildcards.sample:q} \
+                {params.template_args} \
+                --fastq-r1 {input.fq_R1:q} \
+                --fastq-r2 {input.fq_R2:q} \
+                --cell-barcode-whitelist {input.whitelist:q} \
+                --cell-barcode-length {params.cell_barcode_length:q} \
+                --umi-length {params.umi_length:q} \
+                --output-root {params.output_root:q} \
+                --barcode-metrics {output.barcode_metrics:q} \
+                --work-dir {params.work_dir:q} \
+                --chunk-size {params.chunk_size:q} \
+                --min-reads-per-allele-group {params.min_reads_per_allele_group:q} \
+                --seq-5prime-max-edits {params.seq_5prime_max_edits:q} \
+                --seq-3prime-upper-n {params.seq_3prime_upper_n:q} \
+                --seq-3prime-max-mismatches {params.seq_3prime_max_mismatches:q} \
+                --min-cell-read-fraction {params.min_cell_read_fraction:q} \
+                --read-cutoff {params.read_cutoff:q} \
+                > {log:q} 2>&1
+            """
+
+    rule merge_darlin_template_barcodes:
+        input:
+            lambda wildcards: expand(
+                str(DARLIN_WORK_DIR / "{template}" / "{sample}" / "DARLIN_Barcodes.csv"),
+                template=[wildcards.template],
+                sample=DARLIN_SAMPLE_LIST,
+            )
+        output:
+            csv=str(DARLIN_WORK_DIR / "{template}" / "DARLIN_Barcodes.csv.gz"),
+            checksum=str(DARLIN_WORK_DIR / "{template}" / "DARLIN_Barcodes.csv.gz.sha256")
+        log:
+            str(LOG_DIR / "darlin" / "{template}.merge_barcodes.log")
+        threads:
+            1
+        resources:
+            mem_mb=4096,
+            runtime=30
+        params:
+            python=DARLIN_PYTHON,
+            samples=lambda wildcards: DARLIN_SAMPLE_LIST,
+            locus=lambda wildcards: darlin_locus_for_template(wildcards.template),
+            configfile=CONFIGFILE_PATH
+        shell:
+            """
+            mkdir -p "$(dirname {output.csv:q})" "$(dirname {log:q})"
+            {params.python:q} -m lemmus merge-barcodes \
+                --input-files {input:q} \
+                --samples {params.samples:q} \
+                --template {wildcards.template:q} \
+                --locus {params.locus:q} \
+                --configfile {params.configfile:q} \
+                --output {output.csv:q} \
+                --checksum-output {output.checksum:q} \
+                > {log:q} 2>&1
+            """
+
+    rule build_darlin_clone_table:
+        input:
+            barcodes=expand(
+                str(DARLIN_WORK_DIR / "{template}" / "DARLIN_Barcodes.csv.gz"),
+                template=DARLIN_TEMPLATES,
+            ),
+            checksums=expand(
+                str(DARLIN_WORK_DIR / "{template}" / "DARLIN_Barcodes.csv.gz.sha256"),
+                template=DARLIN_TEMPLATES,
+            )
+        output:
+            DARLIN_FINAL_OUTPUTS
+        log:
+            str(LOG_DIR / "darlin" / "build_clone_table.log")
+        threads:
+            1
+        resources:
+            mem_mb=4096,
+            runtime=30
+        params:
+            python=DARLIN_PYTHON,
+            templates=DARLIN_TEMPLATES,
+            loci=[darlin_locus_for_template(template) for template in DARLIN_TEMPLATES],
+            configfile=CONFIGFILE_PATH,
+            final_output=lambda wildcards, output: output[0]
+        shell:
+            """
+            mkdir -p "$(dirname {params.final_output:q})" "$(dirname {log:q})"
+            {params.python:q} -m lemmus build-clone-table \
+                --barcode-files {input.barcodes:q} \
+                --checksum-files {input.checksums:q} \
+                --templates {params.templates:q} \
+                --loci {params.loci:q} \
+                --configfile {params.configfile:q} \
+                --output {params.final_output:q} \
+                > {log:q} 2>&1
+            """
+# RNA/DARLIN QC 层：保留独立 workflow 的原生 QC 与逐 read fate 证据。
+
+
+def resolve_read_fate_protocol():
+    declared = {
+        str(value).strip().lower()
+        for value in [
+            config.get("pipeline_mode", ""),
+            *[row.get("protocol", "") for row in SAMPLE_MANIFEST],
+        ]
+        if str(value).strip()
+    }
+    invalid = declared.difference(REGISTERED_PROTOCOLS)
+    if invalid:
+        raise ValueError(f"Unsupported read-fate protocol declaration(s): {sorted(invalid)}")
+    if len(declared) > 1:
+        raise ValueError(f"Conflicting read-fate protocol declarations: {sorted(declared)}")
+    return next(iter(declared), CONFIGURED_PIPELINE_MODE)
+
+
+READ_FATE_PROTOCOL = resolve_read_fate_protocol()
+CABERNET_READ_FATE_WORK_DIR = READ_FATE_WORK_DIR / "cabernet"
+DARLIN_READ_FATE_WORK_DIR = READ_FATE_WORK_DIR / "darlin"
+RNA_READ_FATE_SAMPLES = RNA_SAMPLES
+RNA_READ_FATE_SAMPLE_TSVS = expand(
+    str(
+        CABERNET_READ_FATE_WORK_DIR
+        / "{sample}.read_fate.tsv"
+    ),
+    sample=RNA_READ_FATE_SAMPLES,
+)
+RNA_READ_FATE_SAMPLE_SUMMARIES = [
+    path.replace(".read_fate.tsv", ".read_fate.summary.json")
+    for path in RNA_READ_FATE_SAMPLE_TSVS
+]
+RNA_READ_FATE_SAMPLE_CHECKSUMS = [
+    path.replace(".read_fate.tsv", ".read_fate.tsv.sha256")
+    for path in RNA_READ_FATE_SAMPLE_TSVS
+]
+DARLIN_READ_FATE_SAMPLES = DARLIN_AVAILABLE_SAMPLE_LIST if DARLIN_ENABLED else []
+DARLIN_READ_FATE_SAMPLE_TSVS = expand(
+    str(DARLIN_READ_FATE_WORK_DIR / "{sample}.read_fate.tsv"),
+    sample=DARLIN_READ_FATE_SAMPLES,
+)
+DARLIN_READ_FATE_SAMPLE_SUMMARIES = [
+    path.replace(".read_fate.tsv", ".read_fate.summary.json")
+    for path in DARLIN_READ_FATE_SAMPLE_TSVS
+]
+DARLIN_READ_FATE_SAMPLE_CHECKSUMS = [
+    path.replace(".read_fate.tsv", ".read_fate.tsv.sha256")
+    for path in DARLIN_READ_FATE_SAMPLE_TSVS
+]
+READ_FATE_WIRED_MODALITIES = []
+if RNA_READ_FATE_SAMPLES:
+    READ_FATE_WIRED_MODALITIES.append("RNA")
+if DARLIN_READ_FATE_SAMPLES:
+    READ_FATE_WIRED_MODALITIES.append("DARLIN")
+READ_FATE_WIRED_ARGS = " ".join(
+    f"--wired-modality {modality}" for modality in READ_FATE_WIRED_MODALITIES
+)
+
+def fastq_for_read(wildcards):
+    return RNA_FASTQ_PAIRS[wildcards.sample][wildcards.read]
+
+
+rule cabernet_rna_read_fate_sample:
+    input:
+        barcode_read=input_read_for_mate(RNA_BARCODE_MATE),
+        insert_read=input_read_for_mate(RNA_INSERT_MATE),
+        whitelist=rules.write_rna_whitelist.output.whitelist
+    output:
+        tsv=temp(str(CABERNET_READ_FATE_WORK_DIR / "{sample}.read_fate.tsv")),
+        summary=temp(str(CABERNET_READ_FATE_WORK_DIR / "{sample}.read_fate.summary.json")),
+        checksum=temp(str(CABERNET_READ_FATE_WORK_DIR / "{sample}.read_fate.tsv.sha256"))
+    log:
+        str(LOGS_ROOT / "read_fate" / "{sample}.log")
+    resources:
+        mem_mb=512,
+        runtime=120
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p "$(dirname {output.tsv:q})" "$(dirname {log:q})"
+        python -m lemmus read-fate collect-rna \
+            --sample-id {wildcards.sample:q} \
+            --barcode-read {input.barcode_read:q} \
+            --insert-read {input.insert_read:q} \
+            --whitelist {input.whitelist:q} \
+            --output-tsv {output.tsv:q} \
+            --summary-json {output.summary:q} \
+            --checksum {output.checksum:q} \
+            > {log:q} 2>&1
+        """
+
+def darlin_raw_fastq(read):
+    def _darlin_raw_fastq(wildcards):
+        return DARLIN_RAW_FASTQ_PAIRS[wildcards.sample][read]
+
+    return _darlin_raw_fastq
+
+
+def darlin_template_read_fate_sidecars(wildcards):
+    return expand(
+        str(DARLIN_WORK_DIR / "{template}" / "{sample}" / "read_fate.tsv.gz"),
+        template=DARLIN_TEMPLATES,
+        sample=[wildcards.sample],
+    )
+
+
+rule darlin_read_fate_sample:
+    input:
+        raw_r1=darlin_raw_fastq("R1"),
+        raw_r2=darlin_raw_fastq("R2"),
+        sidecars=darlin_template_read_fate_sidecars
+    output:
+        tsv=temp(str(DARLIN_READ_FATE_WORK_DIR / "{sample}.read_fate.tsv")),
+        summary=temp(str(DARLIN_READ_FATE_WORK_DIR / "{sample}.read_fate.summary.json")),
+        checksum=temp(str(DARLIN_READ_FATE_WORK_DIR / "{sample}.read_fate.tsv.sha256"))
+    log:
+        str(LOGS_ROOT / "read_fate" / "{sample}.darlin.log")
+    resources:
+        mem_mb=512,
+        runtime=120
+    params:
+        templates=(DARLIN_TEMPLATES if DARLIN_ENABLED else [])
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p "$(dirname {output.tsv:q})" "$(dirname {log:q})"
+        python -m lemmus read-fate collect-darlin \
+            --sample-id {wildcards.sample:q} \
+            --raw-r1 {input.raw_r1:q} \
+            --raw-r2 {input.raw_r2:q} \
+            --sidecar {input.sidecars:q} \
+            --template {params.templates:q} \
+            --output-tsv {output.tsv:q} \
+            --summary-json {output.summary:q} \
+            --checksum {output.checksum:q} \
+            > {log:q} 2>&1
+        """
+
+
+rule rna_darlin_read_fate:
+    input:
+        tsv=RNA_READ_FATE_SAMPLE_TSVS + DARLIN_READ_FATE_SAMPLE_TSVS,
+        summary=RNA_READ_FATE_SAMPLE_SUMMARIES + DARLIN_READ_FATE_SAMPLE_SUMMARIES,
+        checksum=RNA_READ_FATE_SAMPLE_CHECKSUMS + DARLIN_READ_FATE_SAMPLE_CHECKSUMS
+    output:
+        tsv=READ_FATE_TSV,
+        summary=READ_FATE_SUMMARY,
+        checksum=READ_FATE_CHECKSUM
+    log:
+        str(LOGS_ROOT / "read_fate" / "merge.log")
+    resources:
+        mem_mb=512,
+        runtime=120
+    params:
+        wired_arg=READ_FATE_WIRED_ARGS
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p "$(dirname {output.tsv:q})" "$(dirname {log:q})"
+        python -m lemmus read-fate merge \
+            --inputs {input.tsv:q} \
+            --input-summary {input.summary:q} \
+            --input-checksum {input.checksum:q} \
+            {params.wired_arg} \
+            --output-tsv {output.tsv:q} \
+            --summary-json {output.summary:q} \
+            --checksum {output.checksum:q} \
+            > {log:q} 2>&1
+        """
+
+
+rule rna_fastqc_raw_reads:
+    input:
+        fastq=fastq_for_read
+    output:
+        zip=str(RNA_FASTQC_DIR / "{sample}_{read}_fastqc.zip")
+    log:
+        str(LOGS_ROOT / "fastqc" / "{sample}_{read}.fastqc.log")
+    threads: 1
+    resources:
+        mem_mb=2048,
+        runtime=60
+    params:
+        outdir=RNA_FASTQC_DIR,
+        link=lambda wildcards: RNA_FASTQC_LINK_DIR / f"{wildcards.sample}_{wildcards.read}.fastq.gz",
+        html=lambda wildcards: RNA_FASTQC_DIR / f"{wildcards.sample}_{wildcards.read}_fastqc.html"
+    shell:
+        """
+        mkdir -p {params.outdir:q} "$(dirname {params.link:q})" "$(dirname {log:q})"
+        rm -f {params.link:q} {output.zip:q} {params.html:q}
+        ln -s {input.fastq:q} {params.link:q}
+        fastqc --quiet --threads {threads} --outdir {params.outdir:q} {params.link:q} > {log:q} 2>&1
+        # ZIP 是稳定的原生 QC 输入；独立 HTML 不作为正式结果保留。
+        rm -f {params.link:q} {params.html:q}
+        """
+
+rule build_multiqc_custom_content:
+    input:
+        rna_h5ads=RNA_TARGETS,
+        map_infos=RNA_SIMPLEAF_MAP_INFOS,
+        quant_jsons=RNA_SIMPLEAF_QUANT_JSONS,
+        darlin=DARLIN_FINAL_OUTPUTS,
+        darlin_barcode_metrics=DARLIN_BARCODE_METRICS
+    output:
+        custom_dir=directory(str(MULTIQC_CUSTOM_DIR)),
+        alignment=( [str(RNA_QC_DIR / "rna_darlin_cell_alignment.tsv")] if DARLIN_FINAL_OUTPUTS else [] )
+    log:
+        str(LOGS_ROOT / "multiqc" / "custom_content.log")
+    resources:
+        mem_mb=4096,
+        runtime=30
+    params:
+        sample_args=" ".join(f"--sample {shlex.quote(sample)}" for sample in RNA_SAMPLES),
+        h5ad_args=" ".join(f"--rna-h5ad {shlex.quote(str(path))}" for path in RNA_TARGETS),
+        map_args=" ".join(f"--map-info {shlex.quote(str(path))}" for path in RNA_SIMPLEAF_MAP_INFOS),
+        quant_args=" ".join(f"--quant-json {shlex.quote(str(path))}" for path in RNA_SIMPLEAF_QUANT_JSONS),
+        darlin_arg=(
+            f"--darlin-clone-table {shlex.quote(str(DARLIN_FINAL_OUTPUTS[0]))}"
+            if DARLIN_FINAL_OUTPUTS
+            else ""
+        ),
+        alignment_arg=(
+            f"--alignment-output {shlex.quote(str(RNA_QC_DIR / 'rna_darlin_cell_alignment.tsv'))}"
+            if DARLIN_FINAL_OUTPUTS
+            else ""
+        ),
+        darlin_barcode_args=" ".join(
+            f"--darlin-barcode-metrics {shlex.quote(str(path))}"
+            for path in DARLIN_BARCODE_METRICS
+        )
+    shell:
+        """
+        set -euo pipefail
+        rm -rf {output.custom_dir:q}
+        mkdir -p {output.custom_dir:q} "$(dirname {log:q})"
+        python -m lemmus multiqc-custom \
+            {params.sample_args} \
+            {params.h5ad_args} \
+            {params.map_args} \
+            {params.quant_args} \
+            {params.darlin_arg} \
+            {params.darlin_barcode_args} \
+            {params.alignment_arg} \
+            --output-dir {output.custom_dir:q} \
+            > {log:q} 2>&1
+        test -d {output.custom_dir:q}
+        """
+
+
+rule multiqc_report:
+    input:
+        fastqc=RNA_FASTQC_OUTPUTS,
+        custom_dir=rules.build_multiqc_custom_content.output.custom_dir
+    output:
+        report=str(MULTIQC_REPORT),
+        data=directory(str(MULTIQC_DATA_DIR))
+    log:
+        str(LOGS_ROOT / "multiqc" / "multiqc.log")
+    resources:
+        mem_mb=4096,
+        runtime=60
+    params:
+        outdir=str(RNA_QC_DIR),
+        fastqc_dir=str(RNA_FASTQC_DIR)
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {params.outdir:q} "$(dirname {log:q})"
+        rm -rf {output.data:q}
+        rm -f {output.report:q}
+        multiqc --force \
+            --cl-config 'data_dir_name: multiqc_data' \
+            --outdir {params.outdir:q} \
+            --filename multiqc_report.html \
+            {params.fastqc_dir:q} {input.custom_dir:q} \
+            > {log:q} 2>&1
+        test -s {output.report:q}
+        test -d {output.data:q}
+        """

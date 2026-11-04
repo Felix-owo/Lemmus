@@ -1,0 +1,59 @@
+# macOS / editors
+.DS_Store
+**/.DS_Store
+*.swp
+*.swo
+*.tmp
+*.bak
+*.bak.*
+*~
+
+# Python / test caches
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# Snakemake and managed environments
+.snakemake/
+**/.snakemake/
+/conda/
+/logs
+
+# Managed reference generations
+/resources/*_reference/
+/resources/*_reference.building.*/
+/resources/reference_source/
+/resources/droplet/
+
+# Project run directories
+/run_pipeline.sh
+**/00_config/
+**/01_raw/
+**/02_work/
+**/03_results/
+**/04_logs/
+**/05_tmp/
+**/06_downstream/
+
+# Sequencing / alignment data
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.sam
+*.bam
+*.bai
+*.cram
+*.crai
+
+# Other generated artifacts
+/dist/
+slurm-*.out
+slurm-*.err
+
+# ZCode workspace session config
+.zcode/
