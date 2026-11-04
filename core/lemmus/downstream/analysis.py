@@ -178,7 +178,7 @@ def annotate_human(adata, markers_top30, census_params: dict, pipeline_root: Pat
     """CELLxGENE Census scVI consensus (human only; pretrained models are human)."""
     from . import annotation_human as cta
 
-    EXPECTED_ANNOTATION_MODULE_VERSION = "v35"
+    EXPECTED_ANNOTATION_MODULE_VERSION = "v36"
     if getattr(cta, "MODULE_VERSION", None) != EXPECTED_ANNOTATION_MODULE_VERSION:
         raise AnalysisError(
             f"Wrong lemmus.downstream.annotation_human module loaded: version={getattr(cta, 'MODULE_VERSION', None)!r}; "
@@ -188,7 +188,7 @@ def annotate_human(adata, markers_top30, census_params: dict, pipeline_root: Pat
     if not (model_dir / "model.pt").is_file():
         raise AnalysisError(
             f"缺少 {model_dir / 'model.pt'}\n"
-            f"aws s3 cp --no_sign-request {cta.SCVI_MODEL_URI} {model_dir / 'model.pt'}"
+            "请在登录节点运行 bash core/doctor.sh atlas 准备完整离线参考"
         )
     if cta.CENSUS_VERSION != census_params["census_version"]:
         raise AnalysisError(f"Module Census version {cta.CENSUS_VERSION} != {census_params['census_version']}")

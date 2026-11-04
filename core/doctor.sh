@@ -22,7 +22,7 @@ usage() {
 无参数                         准备全部受管环境、hg38/mm10 PG+45S、白名单、Atlas，并检查协议 DAG
 conda [--check]               检查 control/rules/atlas/calling 环境和固定设计白名单
 conda [--update] [--conda P]  原子重建 control/rules/atlas，并准备独立 calling 环境
-atlas [--check]               准备或仅检查 Census 2025-11-08 scVI model/API
+atlas [--check]               登录节点准备 Census 离线参考；--check 只读核验本地资源
 calling [--check]             独立构建/检查 DD-MET5 calling 环境及固定设计白名单
 reference <species> ...        安装或构建到固定 Pipeline resources/<species>_reference/pg45s
   --source DIR [--link|--copy]
@@ -102,7 +102,11 @@ rna_darlin_setup_calling() {
   fi
   (($#==0)) || { usage >&2; return 2; }
   if rna_darlin_check_calling_env; then
-    "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus prepare-droplet-whitelist
+    if [[ "$(uname -s)" == Linux && -n "${SLURM_JOB_ID:-}" ]]; then
+      rna_darlin_setup_calling --check
+    else
+      "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus prepare-droplet-whitelist
+    fi
     return
   fi
   rna_darlin_require_login_for_conda
@@ -274,12 +278,7 @@ PY
 rna_darlin_check_atlas_assets() {
   [[ -s "$RNA_DARLIN_ATLAS_MODEL" ]] || { echo "缺失: $RNA_DARLIN_ATLAS_MODEL" >&2; return 1; }
   [[ "$(wc -c < "$RNA_DARLIN_ATLAS_MODEL" | tr -d ' ')" == "$RNA_DARLIN_ATLAS_MODEL_SIZE" ]] || { echo "ERROR: Census scVI model size mismatch" >&2; return 1; }
-  "$RNA_DARLIN_ATLAS_ENV/bin/python" - <<'PY'
-import cellxgene_census
-with cellxgene_census.open_soma(census_version="2025-11-08"):
-    pass
-print("CELLxGENE Census 2025-11-08: PASS")
-PY
+  "$RNA_DARLIN_ATLAS_ENV/bin/python" -m lemmus census-reference check
 }
 
 rna_darlin_setup_ontology() {
@@ -319,21 +318,28 @@ rna_darlin_setup_atlas() {
 
 # 完整 Doctor 已核验环境；资产准备不重复导入整套 atlas 科学依赖。
 rna_darlin_prepare_atlas_assets() {
+  if [[ "$(uname -s)" == Linux && -n "${SLURM_JOB_ID:-}" ]]; then
+    rna_darlin_setup_ontology check
+    rna_darlin_check_atlas_assets
+    return
+  fi
+  rna_darlin_transaction_lock atlas
   rna_darlin_setup_ontology
   if [[ ! -s "$RNA_DARLIN_ATLAS_MODEL" || "$(wc -c < "$RNA_DARLIN_ATLAS_MODEL" | tr -d ' ')" != "$RNA_DARLIN_ATLAS_MODEL_SIZE" ]]; then
     mkdir -p "$(dirname "$RNA_DARLIN_ATLAS_MODEL")"
-    rna_darlin_transaction_lock atlas
     local tmp
     tmp="$(mktemp "$RNA_DARLIN_ATLAS_MODEL.part.XXXXXXXX")"
     RNA_DARLIN_ACTIVE_CANDIDATE="$tmp"
     PATH="$RNA_DARLIN_ATLAS_ENV/bin:$PATH" "$RNA_DARLIN_ATLAS_ENV/bin/aws" s3 cp --no-sign-request --no-progress --only-show-errors \
       s3://cellxgene-contrib-public/models/scvi/2025-11-08/homo_sapiens/model.pt "$tmp"
     [[ "$(wc -c < "$tmp" | tr -d ' ')" == "$RNA_DARLIN_ATLAS_MODEL_SIZE" ]] || { rm -f -- "$tmp"; echo "ERROR: downloaded model size mismatch" >&2; return 1; }
+    rm -f -- "$(dirname "$RNA_DARLIN_ATLAS_MODEL")/census_reference.json"
     mv "$tmp" "$RNA_DARLIN_ATLAS_MODEL"
     RNA_DARLIN_ACTIVE_CANDIDATE=""
-    rna_darlin_release_transaction_lock
   fi
+  "$RNA_DARLIN_ATLAS_ENV/bin/python" -m lemmus census-reference prepare
   rna_darlin_check_atlas_assets
+  rna_darlin_release_transaction_lock
 }
 
 # 固定视图只提交已验证候选；旧目录保留，提交失败立即恢复，不递归删除共享参考。
@@ -549,7 +555,11 @@ rna_darlin_check_pipeline_alignment() {
 # 子进程保持独立 errexit；网络失败不妨碍其它物种/reference 与安装自检完成。
 rna_darlin_all() {
   local status=0 species started=$SECONDS
-  bash "$RNA_DARLIN_PIPELINE_ROOT/core/doctor.sh" conda
+  if [[ "$(uname -s)" == Linux && -n "${SLURM_JOB_ID:-}" ]]; then
+    bash "$RNA_DARLIN_PIPELINE_ROOT/core/doctor.sh" conda --check
+  else
+    bash "$RNA_DARLIN_PIPELINE_ROOT/core/doctor.sh" conda
+  fi
   echo "Doctor phase environments: $((SECONDS-started))s"
   for species in hg38 mm10; do
     started=$SECONDS
@@ -568,8 +578,8 @@ rna_darlin_all() {
   fi
   started=$SECONDS
   if bash -c 'source "$1"; rna_darlin_prepare_atlas_assets' -- "$RNA_DARLIN_PIPELINE_ROOT/core/doctor.sh"; then :
-  else echo "ERROR: Atlas 资源/API 准备失败" >&2; status=1; fi
-  echo "Doctor phase atlas assets/API: $((SECONDS-started))s"
+  else echo "ERROR: Atlas 离线参考未就绪；请在登录节点运行 bash core/doctor.sh atlas" >&2; status=1; fi
+  echo "Doctor phase atlas offline reference: $((SECONDS-started))s"
   (( status == 0 )) || return "$status"
   echo "Lemmus Doctor: READY (control/rules/atlas/calling, hg38/mm10 PG+45S, ME5, protocol DAGs)"
 }

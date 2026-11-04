@@ -1,12 +1,12 @@
 # Lemmus
 
-当前版本为Git tag `v5.11`，正式发行包以包内README为准。源码计算位于`core/lemmus/`，下游实现归其`downstream/`子包，顶层`downstream/`只承载Notebook。
+当前版本为Git tag `v5.12`，正式发行包以包内README为准。源码计算位于`core/lemmus/`，下游实现归其`downstream/`子包，顶层`downstream/`只承载Notebook。
 
 Cabernet和Droplet都固定使用 **PG（parsimony-gene）＋物种对应45S竞争参考**。PG拒绝残余多gene歧义，不运行EM，也不将原始分子数取整。支持hg38（人NR_146144.1）与mm10（小鼠NR_046233.2），固定序列及来源见 [45S参考](resources/rrna/README.md)。技术feature `RRNA45S_COMPETITOR` 的计数单独保存在obs/uns；`biological.h5ad`、细胞调用及下游表达不含该feature。它不是生物学单拷贝gene；零技术计数不能证明没有rRNA污染。
 
 本版本采用上述策略；已有其它resolution配置需在Pipeline外明确调整，旧index须用Doctor重建，历史结果不自动重算或覆盖。
 
-Lemmus v5.11（原 RNA_DARLIN_Pipeline）是从 Camellia 拆出的独立 RNA + targeted DARLIN workflow，基于 Snakemake。它可以完成：
+Lemmus v5.12（原 RNA_DARLIN_Pipeline）是从 Camellia 拆出的独立 RNA + targeted DARLIN workflow，基于 Snakemake。它可以完成：
 
 - RNA：Cabernet 3′ 与 DD-MET5 Droplet RNA 独立调用和定量（simpleaf 单一 backend）；
 - DARLIN：targeted lineage barcode 的 streaming 提取、UMI 级等位基因共识与 directional clone denoising；
@@ -44,18 +44,18 @@ Cabernet RNA 路径按标准 TSO-based 3′ UMI scRNA-seq 处理，不再保留 
 
 ## 1. 从 GitHub 下载 Pipeline
 
-从 [v5.11 Release](https://github.com/Felix-owo/Lemmus/releases/tag/v5.11) 下载 `Lemmus-v5.11.tar.gz` 和 `SHA256SUMS`，校验后解压：
+从 [v5.12 Release](https://github.com/Felix-owo/Lemmus/releases/tag/v5.12) 下载 `Lemmus-v5.12.tar.gz` 和 `SHA256SUMS`，校验后解压：
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Lemmus-v5.11.tar.gz
-cd Lemmus-v5.11
+tar -xzf Lemmus-v5.12.tar.gz
+cd Lemmus-v5.12
 ```
 
 也可使用正式 tag 获取代码：
 
 ```bash
-git clone --branch v5.11 --single-branch https://github.com/Felix-owo/Lemmus.git
+git clone --branch v5.12 --single-branch https://github.com/Felix-owo/Lemmus.git
 cd Lemmus
 ```
 
@@ -99,26 +99,28 @@ reference readiness 检查 FASTA、GTF、固定45S序列、两列t2g、piscem in
 HPC 标准顺序与 Alopex 一致：
 
 1. 在本机校验正确的 reference、索引、固定45S及封存标记，再上传至 HPC 对应路径并核对版本/校验值。只补传缺失或不匹配的组件，保留 PG＋物种45S 的科学约定。
-2. 在登录节点提前下载和准备 Conda 等依赖。Lemmus 需要安装环境时使用 `bash core/doctor.sh conda`；已有正确环境直接复用，不因源码更新重复安装。
+2. 在登录节点提前下载和准备 Conda 等依赖。运行 `bash core/doctor.sh conda` 准备环境及固定白名单，再运行 `bash core/doctor.sh atlas` 准备 Census model、基因映射、当前参数的 balanced reference embedding 和 Cell Ontology；正确资源原样复用。
 3. 在**现有 JupyterLab 的 Terminal** 中进入 Pipeline 根目录，运行 `bash core/doctor.sh`。完整 Doctor 与科学调用在 Jupyter 的原 allocation 中执行，不在登录节点运行，不另起独立 Doctor allocation。
 
 普通部署只要求更新 Pipeline 后跑通标准 Doctor，不默认追加全仓开发回归或额外 benchmark。代理日志、沙箱和备份统一留在已授权的 `MethylTreeAgent` 工作根。
 
-无参 Doctor 准备 control/rules/atlas/calling 四个受管环境、固定 ME5 白名单、hg38/mm10 PG＋45S 参考、Census scVI model 与 Cell Ontology，再检查 Cabernet/Droplet × hg38/mm10 四个完整 DAG、跨 Pipeline 身份和当前目录项目的参考。各阶段失败均非零退出，缺 reference 不再作为完整 Doctor 的跳过项；Atlas API 故障不会阻止独立 reference 和自检阶段完成。配置模板只读，不修改已有项目配置或科学结果。
+本机无参 Doctor 准备并检查全部资源。HPC 计算节点无参 Doctor 只读检查预先准备的四环境、白名单与 Census 离线参考，复用或从本地输入构建 PG＋45S，检查 Cabernet/Droplet × hg38/mm10 四个完整 DAG、跨 Pipeline 身份和当前目录项目参考。缺资源、损坏或参数不匹配均非零退出，不跳过必需检查；配置模板只读，不修改已有项目配置或科学结果。
 
-Conda 构建/发布仅在 HPC 登录节点执行；allocation 内可复用已就绪环境，缺环境时给出登录节点准备命令。Census 查询仍需要运行节点能够访问官方服务，下载模型不能代替在线 API 可用性。
+HPC 计算节点不要求外网。Conda、白名单、模型、Census metadata/embedding 与 ontology 的下载在登录节点完成，计算节点的 Doctor、gene-overlap diagnostic 和正式 scVI 注释均离线读取。当前 Census 2025-11-08 的采样参数与 seed 绑定离线参考；不匹配时回登录节点准备，不在分析中联网重建，也不更换 Census 版本。
 
 分段维护命令如下；环境准备在登录节点，验证在 Jupyter 中执行：
 
 ```bash
 core/doctor.sh conda          # 准备四个受管环境和固定 ME5 白名单
+core/doctor.sh atlas          # 登录节点准备 Census 离线参考和 ontology
 core/doctor.sh conda --check  # 只读检查环境和白名单
+core/doctor.sh atlas --check  # 计算节点离线核验资源与 SHA256
 core/doctor.sh test           # 编译、配置/schema、运行自检与可用的full-DAG dry-run
 ```
 
 rules 环境至少提供：Python、simpleaf、piscem、alevin-fry、umi_tools（仅 DARLIN 使用）、FastQC、MultiQC、Java。当前生产版本策略以可从 Bioconda 一致安装为优先（simpleaf 0.28 系列、piscem 0.22.1 系列、alevin-fry 0.18 系列）；版本升级必须同时验证 index-format compatibility 和 doctor smoke。
 
-Doctor 下载 Census model 时使用 atlas 环境自己的 AWS CLI 与 Python，不依赖登录 shell 的 Python。
+Doctor 下载 Census model 时使用 atlas 环境自己的 AWS CLI 与 Python，不依赖登录 shell 的 Python。`resources/hg38_reference/census_2025-11-08_scvi/` 保存 `model.pt`、`census_gene_map.npz`、`census_2025-11-08_scvi_reference.npz`；`census_reference.json` 最后提交，绑定采样身份与各文件 size/SHA256。准备失败不发布完成标记，原有正确 reference NPZ 不重写。
 
 `core/doctor.sh test` 不依赖Git或开发测试目录：执行Python compile、Shell语法、配置/schema、barcode纠正与整数H5AD写读自检；受管环境和reference存在时还执行两物种×两协议的Snakemake full-DAG dry-run；单独 test 缺依赖可明确跳过，无参 Doctor 要求全部四项通过。自检使用临时合成输入，不能替代原始数据的科学验收。
 

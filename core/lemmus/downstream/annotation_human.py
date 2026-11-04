@@ -10,16 +10,160 @@ import re
 import time
 import os
 import subprocess
+import hashlib
+import sys
+import tempfile
+from zipfile import BadZipFile
 
 import anndata
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
-MODULE_VERSION = "v35"
+MODULE_VERSION = "v36"
 CENSUS_VERSION = "2025-11-08"
 SCVI_MODEL_URI = "s3://cellxgene-contrib-public/models/scvi/2025-11-08/homo_sapiens/model.pt"
 CELL_ONTOLOGY_URL = "https://purl.obolibrary.org/obo/cl/cl-basic.obo"
+SCVI_MODEL_SIZE = 931490141
+CENSUS_GENE_MAP = "census_gene_map.npz"
+CENSUS_REFERENCE_SEAL = "census_reference.json"
+
+
+def _require_download_host():
+    if sys.platform.startswith("linux") and os.environ.get("SLURM_JOB_ID"):
+        raise RuntimeError("Download preparation must run on the login node: bash core/doctor.sh atlas")
+
+
+def _file_identity(path: Path) -> dict:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        before = os.fstat(handle.fileno())
+        for block in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+            digest.update(block)
+        after = os.fstat(handle.fileno())
+    signature = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+    if signature(before) != signature(after) or signature(after) != signature(path.stat()):
+        raise ValueError(f"Census input changed while hashing: {path}")
+    return {"size": after.st_size, "sha256": digest.hexdigest()}
+
+
+def _default_reference_meta() -> dict:
+    from .config import DEFAULT_CENSUS_PARAMS, DEFAULT_ANALYSIS_PARAMS
+    p = DEFAULT_CENSUS_PARAMS
+    return _reference_cache_meta(
+        p["census_version"], p["candidate_cells"], p["max_cells_per_type"],
+        p["max_reference_cells"], p["normal_only"], p["tissues"],
+        DEFAULT_ANALYSIS_PARAMS["random_state"], p["metadata_block_size"], p["embedding_batch_size"],
+    )
+
+
+def _read_local_gene_map(model_dir: Path, census_version: str) -> pd.DataFrame:
+    with np.load(model_dir / CENSUS_GENE_MAP, allow_pickle=False) as value:
+        if json.loads(str(value["meta"].item())) != {
+            "census_version": census_version, "organism": "Homo sapiens",
+        }:
+            raise ValueError("Census gene-map identity mismatch")
+        ids, names = value["feature_id"], value["feature_name"]
+        if (ids.ndim != 1 or names.shape != ids.shape or not len(ids)
+                or ids.dtype.kind != "U" or names.dtype.kind != "U"
+                or len(np.unique(ids)) != len(ids) or np.any(ids == "") or np.any(names == "")):
+            raise ValueError("Invalid Census gene map")
+        # Preserve official row order and duplicate symbols: only unambiguous symbols map.
+        return pd.DataFrame({"feature_id": ids, "feature_name": names})
+
+
+def _validate_reference_arrays(path: Path, expected: dict):
+    if not _reference_cache_matches(path, expected):
+        raise ValueError("Census reference parameters do not match")
+    with np.load(path, allow_pickle=False) as ref:
+        embedding = ref["embedding"]
+        if (embedding.ndim != 2 or embedding.shape[1] != 50 or not len(embedding)
+                or embedding.dtype != np.float32 or not np.isfinite(embedding).all()):
+            raise ValueError("Invalid Census reference embedding")
+        for key in ("cell_type", "ontology", "tissue", "dataset_id"):
+            values = ref[key]
+            if values.shape != (len(embedding),) or values.dtype.kind != "U" or np.any(values == ""):
+                raise ValueError(f"Invalid Census reference {key}")
+
+
+def check_census_reference(model_dir: str | Path, expected: dict | None = None) -> dict:
+    """Check the prepared local inputs without contacting Census or modifying files."""
+    model_dir = Path(model_dir)
+    expected = _default_reference_meta() if expected is None else expected
+    try:
+        seal_path = model_dir / CENSUS_REFERENCE_SEAL
+        original = seal_path.read_bytes()
+        seal = json.loads(original)
+        cache_name = f"census_{expected['census_version']}_scvi_reference.npz"
+        names = {"model.pt", CENSUS_GENE_MAP, cache_name}
+        if (seal["schema"] != 1 or seal["reference_meta"] != expected
+                or set(seal["files"]) != names):
+            raise ValueError("Census preparation identity mismatch")
+        for name in sorted(names):
+            if _file_identity(model_dir / name) != seal["files"][name]:
+                raise ValueError(f"Census prepared file changed: {name}")
+        if seal["files"]["model.pt"]["size"] != SCVI_MODEL_SIZE:
+            raise ValueError("Census scVI model size mismatch")
+        _read_local_gene_map(model_dir, expected["census_version"])
+        _validate_reference_arrays(model_dir / cache_name, expected)
+        if seal_path.read_bytes() != original:
+            raise ValueError("Census preparation changed during validation")
+        return seal
+    except (OSError, ValueError, KeyError, TypeError, BadZipFile) as exc:
+        raise RuntimeError(
+            f"Census offline reference is missing, changed or incompatible: {model_dir}. "
+            "On the login node run bash core/doctor.sh atlas, then rerun on the compute node."
+        ) from exc
+
+
+def prepare_census_reference(model_dir: str | Path):
+    """Login-node producer; Doctor owns the Atlas transaction lock and model download."""
+    _require_download_host()
+    model_dir = Path(model_dir)
+    expected = _default_reference_meta()
+    if (model_dir / "model.pt").stat().st_size != SCVI_MODEL_SIZE:
+        raise ValueError("Census scVI model size mismatch")
+    cache_name = f"census_{expected['census_version']}_scvi_reference.npz"
+    cache = model_dir / cache_name
+    with tempfile.TemporaryDirectory(prefix=".census.", dir=model_dir) as work:
+        work = Path(work)
+        replacements = []
+        try:
+            _read_local_gene_map(model_dir, expected["census_version"])
+        except (OSError, ValueError, KeyError, TypeError, BadZipFile):
+            import cellxgene_census
+            with cellxgene_census.open_soma(census_version=expected["census_version"]) as census:
+                var = _census_var_map(census)
+            np.savez_compressed(
+                work / CENSUS_GENE_MAP,
+                meta=np.asarray(json.dumps({"census_version": expected["census_version"],
+                                           "organism": "Homo sapiens"}, sort_keys=True)),
+                feature_id=var["feature_id"].to_numpy(dtype=str),
+                feature_name=var["feature_name"].to_numpy(dtype=str),
+            )
+            _read_local_gene_map(work, expected["census_version"])
+            replacements.append(CENSUS_GENE_MAP)
+        try:
+            _validate_reference_arrays(cache, expected)
+        except (OSError, ValueError, KeyError, TypeError, BadZipFile):
+            params = {k: expected[k] for k in (
+                "census_version", "candidate_cells", "max_cells_per_type", "max_reference_cells",
+                "normal_only", "tissues", "seed", "metadata_block_size", "embedding_batch_size",
+            )}
+            build_reference_cache(work / cache_name, **params)
+            _validate_reference_arrays(work / cache_name, expected)
+            replacements.append(cache_name)
+        seal = {"schema": 1, "reference_meta": expected, "files": {
+            name: _file_identity((work if name in replacements else model_dir) / name)
+            for name in ("model.pt", CENSUS_GENE_MAP, cache_name)
+        }}
+        (work / CENSUS_REFERENCE_SEAL).write_text(json.dumps(seal, indent=2) + "\n")
+        # All candidates validate before withdrawing the old completion marker.
+        (model_dir / CENSUS_REFERENCE_SEAL).unlink(missing_ok=True)
+        for name in replacements:
+            os.replace(work / name, model_dir / name)
+        os.replace(work / CENSUS_REFERENCE_SEAL, model_dir / CENSUS_REFERENCE_SEAL)
+    check_census_reference(model_dir, expected)
 
 
 @dataclass
@@ -34,6 +178,7 @@ class ConsensusAnnotationResult:
 
 
 def download_scvi_model(model_dir: str | Path) -> Path:
+    _require_download_host()
     model_dir = Path(model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
     target = model_dir / "model.pt"
@@ -47,6 +192,7 @@ def download_scvi_model(model_dir: str | Path) -> Path:
 
 
 def download_cell_ontology(path: str | Path) -> Path:
+    _require_download_host()
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
@@ -121,12 +267,12 @@ def _census_var_map(census) -> pd.DataFrame:
     return var
 
 
-def _query_for_scvi(adata: anndata.AnnData, census) -> anndata.AnnData:
+def _query_for_scvi(adata: anndata.AnnData, model_dir: Path, census_version: str) -> anndata.AnnData:
     X = adata.layers["counts"] if "counts" in adata.layers else adata.X
     q = anndata.AnnData(X=sp.csr_matrix(X.copy()), obs=adata.obs.copy())
     q.var_names = adata.var_names.astype(str)
     if np.mean(q.var_names.str.startswith("ENSG")) <= 0.5:
-        vm = _census_var_map(census)
+        vm = _read_local_gene_map(model_dir, census_version)
         unique = vm[~vm["feature_name"].duplicated(keep=False)].set_index("feature_name")["feature_id"]
         keep = q.var_names.isin(unique.index)
         q = q[:, keep].copy()
@@ -145,15 +291,14 @@ def diagnose_census_gene_overlap(
     model_dir: str | Path,
     census_version: str = CENSUS_VERSION,
 ) -> dict[str, float | int]:
-    import cellxgene_census
     import scvi
 
     model_dir = Path(model_dir)
+    check_census_reference(model_dir)
     if not (model_dir / "model.pt").is_file():
         raise FileNotFoundError(f"Missing Census scVI model: {model_dir / 'model.pt'}")
 
-    with cellxgene_census.open_soma(census_version=census_version) as census:
-        q = _query_for_scvi(adata, census)
+    q = _query_for_scvi(adata, model_dir, census_version)
 
     query_before = int(adata.n_vars)
     query_after = int(q.n_vars)
@@ -234,17 +379,16 @@ def project_query_scvi(
     query_max_epochs: int = 200,
     seed: int = 42,
 ) -> np.ndarray:
-    import cellxgene_census
     import scvi
 
     deterministic = _set_deterministic_seed(seed)
 
     model_dir = Path(model_dir)
+    check_census_reference(model_dir)
     if not (model_dir / "model.pt").is_file():
         raise FileNotFoundError(model_dir / "model.pt")
 
-    with cellxgene_census.open_soma(census_version=census_version) as census:
-        q = _query_for_scvi(adata, census)
+    q = _query_for_scvi(adata, model_dir, census_version)
 
     query_before = int(adata.n_vars)
     query_after = int(q.n_vars)
@@ -378,7 +522,7 @@ def _reference_cache_matches(path: str | Path, expected: dict) -> bool:
             raw = ref["cache_meta"]
             text = str(raw.item() if raw.ndim == 0 else raw.reshape(-1)[0])
             return json.loads(text) == expected
-    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+    except (OSError, ValueError, KeyError, BadZipFile):
         return False
 
 
@@ -593,6 +737,7 @@ def build_reference_cache(
     metadata_block_size: int = 500_000,
     embedding_batch_size: int = 50_000,
 ) -> Path:
+    _require_download_host()
     import cellxgene_census
 
     build_t0 = time.perf_counter()
@@ -988,8 +1133,8 @@ def annotate_from_census_consensus(
     min_mean_probability: float = 0.35,
     min_ontology_depth: int = 3,
     seed: int = 42,
-    metadata_block_size: int = 50_000,
-    embedding_batch_size: int = 25_000,
+    metadata_block_size: int = 500_000,
+    embedding_batch_size: int = 50_000,
     weighted_knn_k: int = 50,
     uncertainty_threshold: float = 0.50,
     query_max_epochs: int = 200,
@@ -1002,37 +1147,12 @@ def annotate_from_census_consensus(
         census_version, candidate_cells, max_cells_per_type, max_reference_cells,
         normal_only, tissues, seed, metadata_block_size, embedding_batch_size,
     )
-    cache_valid = _reference_cache_matches(reference_cache, expected_cache_meta)
-    if not cache_valid:
-        print(
-            f"[Census cache] MISS/INVALID: {reference_cache}\n"
-            "    building a new compact reference; stages 1 and 3 use network I/O.",
-            flush=True,
-        )
-        tmp_cache = reference_cache.with_name(
-            f".{reference_cache.stem}.rebuild.{os.getpid()}.npz"
-        )
-        tmp_cache.unlink(missing_ok=True)
-        try:
-            build_reference_cache(
-                tmp_cache,
-                census_version=census_version,
-                candidate_cells=candidate_cells,
-                max_cells_per_type=max_cells_per_type,
-                max_reference_cells=max_reference_cells,
-                normal_only=normal_only,
-                tissues=tissues,
-                seed=seed,
-                metadata_block_size=metadata_block_size,
-                embedding_batch_size=embedding_batch_size,
-            )
-            os.replace(tmp_cache, reference_cache)
-        finally:
-            tmp_cache.unlink(missing_ok=True)
-    else:
-        _progress(1, f"Reference cache valid: {reference_cache.name}")
-        _progress(2, "Balanced reference already cached; skipping metadata sampling.")
-        _progress(3, "scVI reference embeddings already cached; skipping cloud fetch.")
+    if reference_cache.resolve() != (Path(model_dir) / f"census_{census_version}_scvi_reference.npz").resolve():
+        raise ValueError("Census reference must be the prepared model-directory cache")
+    check_census_reference(model_dir, expected_cache_meta)
+    _progress(1, f"Offline reference valid: {reference_cache.name}")
+    _progress(2, "Using prepared balanced reference metadata.")
+    _progress(3, "Using prepared official scVI reference embeddings.")
 
     _progress(
         4,

@@ -28,6 +28,7 @@ def main(argv=None):
         "write-rna-whitelist": ("inputs", "write_rna_whitelist_main"),
         "finalize-rna-h5ad": ("rna", "finalize_rna_h5ad_main"),
         "rna-reference": ("maintenance", "rna_reference_main"),
+        "census-reference": ("maintenance", "census_reference_main"),
         "prepare-rna-counts": ("rna", "prepare_rna_counts_main"),
         "multiqc-custom": ("reports", "multiqc_custom_main"),
         "env-spec": ("maintenance", "env_spec_main"),

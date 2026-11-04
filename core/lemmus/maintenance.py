@@ -100,6 +100,21 @@ def rna_reference_main(argv=None):
     return 0
 
 
+def census_reference_main(argv=None):
+    """Doctor: login-node preparation or read-only offline validation."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument('operation', choices=['prepare', 'check'])
+    args = parser.parse_args(argv)
+    from .downstream.annotation_human import prepare_census_reference, check_census_reference
+    model_dir = PIPELINE_ROOT / 'resources/hg38_reference/census_2025-11-08_scvi'
+    if args.operation == 'prepare':
+        prepare_census_reference(model_dir)
+    else:
+        check_census_reference(model_dir)
+    print('Census offline reference: PASS (model, gene map, balanced embedding, identity)')
+    return 0
+
+
 def env_spec_main(argv=None):
     """从单一 envs.yaml 提取指定角色为 Conda 可消费 spec。"""
     parser = argparse.ArgumentParser(prog="lemmus env-spec")
