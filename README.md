@@ -1,12 +1,12 @@
 # Lemmus
 
-当前版本为Git tag `v5.9`，正式发行包以包内README为准。源码计算位于`core/lemmus/`，下游实现归其`downstream/`子包，顶层`downstream/`只承载Notebook。
+当前版本为Git tag `v5.10`，正式发行包以包内README为准。源码计算位于`core/lemmus/`，下游实现归其`downstream/`子包，顶层`downstream/`只承载Notebook。
 
 Cabernet和Droplet都固定使用 **PG（parsimony-gene）＋物种对应45S竞争参考**。PG拒绝残余多gene歧义，不运行EM，也不将原始分子数取整。支持hg38（人NR_146144.1）与mm10（小鼠NR_046233.2），固定序列及来源见 [45S参考](resources/rrna/README.md)。技术feature `RRNA45S_COMPETITOR` 的计数单独保存在obs/uns；`biological.h5ad`、细胞调用及下游表达不含该feature。它不是生物学单拷贝gene；零技术计数不能证明没有rRNA污染。
 
 本版本采用上述策略；已有其它resolution配置需在Pipeline外明确调整，旧index须用Doctor重建，历史结果不自动重算或覆盖。
 
-Lemmus v5.9（原 RNA_DARLIN_Pipeline）是从 Camellia 拆出的独立 RNA + targeted DARLIN workflow，基于 Snakemake。它可以完成：
+Lemmus v5.10（原 RNA_DARLIN_Pipeline）是从 Camellia 拆出的独立 RNA + targeted DARLIN workflow，基于 Snakemake。它可以完成：
 
 - RNA：Cabernet 3′ 与 DD-MET5 Droplet RNA 独立调用和定量（simpleaf 单一 backend）；
 - DARLIN：targeted lineage barcode 的 streaming 提取、UMI 级等位基因共识与 directional clone denoising；
@@ -44,18 +44,18 @@ Cabernet RNA 路径按标准 TSO-based 3′ UMI scRNA-seq 处理，不再保留 
 
 ## 1. 从 GitHub 下载 Pipeline
 
-从 [v5.9 Release](https://github.com/Felix-owo/Lemmus/releases/tag/v5.9) 下载 `Lemmus-v5.9.tar.gz` 和 `SHA256SUMS`，校验后解压：
+从 [v5.10 Release](https://github.com/Felix-owo/Lemmus/releases/tag/v5.10) 下载 `Lemmus-v5.10.tar.gz` 和 `SHA256SUMS`，校验后解压：
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Lemmus-v5.9.tar.gz
-cd Lemmus-v5.9
+tar -xzf Lemmus-v5.10.tar.gz
+cd Lemmus-v5.10
 ```
 
 也可使用正式 tag 获取代码：
 
 ```bash
-git clone --branch v5.9 --single-branch https://github.com/Felix-owo/Lemmus.git
+git clone --branch v5.10 --single-branch https://github.com/Felix-owo/Lemmus.git
 cd Lemmus
 ```
 
