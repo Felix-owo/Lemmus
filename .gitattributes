@@ -7,7 +7,7 @@
 *.smk text eol=lf
 Snakefile text eol=lf
 
-# 源码仓保留开发规范、回归与证据；发行包只携带运行/自检及操作文件。
+# 公开运行仓归档排除开发文档、测试与规范；开发仓完整归档保留这些文件。
 /.gitattributes export-ignore
 /.gitignore export-ignore
 /AGENTS.md export-ignore

@@ -19,9 +19,9 @@ usage() {
   cat <<'TXT'
 用法: doctor.sh [conda [--check|--update] [--conda PATH] | calling [--check] | atlas [--check] | reference <species> ... | test | --help]
 
-无参数                         构建/检查常规环境、Census atlas model 并执行安装自检
-conda [--check]               检查 control/rules/atlas 三个受管环境
-conda [--update] [--conda P]  原子重建 control/rules/atlas 环境
+无参数                         准备全部受管环境、hg38/mm10 PG+45S、白名单、Atlas，并检查协议 DAG
+conda [--check]               检查 control/rules/atlas/calling 环境和固定设计白名单
+conda [--update] [--conda P]  原子重建 control/rules/atlas，并准备独立 calling 环境
 atlas [--check]               准备或仅检查 Census 2025-11-08 scVI model/API
 calling [--check]             独立构建/检查 DD-MET5 calling 环境及固定设计白名单
 reference <species> ...        安装或构建到固定 Pipeline resources/<species>_reference/pg45s
@@ -42,7 +42,9 @@ rna_darlin_transaction_lock() {
   printf '%s\n' "$$" > "$lock/pid"
   RNA_DARLIN_ACTIVE_LOCK="$lock"
   RNA_DARLIN_TRANSACTION_KIND="$name"
-  trap 'if [[ -n "${RNA_DARLIN_ACTIVE_CANDIDATE:-}" ]]; then if [[ "${RNA_DARLIN_TRANSACTION_KIND:-}" == reference ]]; then echo "保留失败 reference 候选供诊断/恢复: $RNA_DARLIN_ACTIVE_CANDIDATE" >&2; else rm -rf -- "$RNA_DARLIN_ACTIVE_CANDIDATE"; fi; fi; [[ -n "${RNA_DARLIN_ACTIVE_LOCK:-}" ]] && rm -rf -- "$RNA_DARLIN_ACTIVE_LOCK"' EXIT INT TERM
+  trap 'if [[ -n "${RNA_DARLIN_ACTIVE_CANDIDATE:-}" ]]; then if [[ "${RNA_DARLIN_TRANSACTION_KIND:-}" == reference ]]; then echo "保留失败 reference 候选供诊断/恢复: $RNA_DARLIN_ACTIVE_CANDIDATE" >&2; else rm -rf -- "$RNA_DARLIN_ACTIVE_CANDIDATE"; fi; fi; [[ -n "${RNA_DARLIN_ACTIVE_LOCK:-}" ]] && rm -rf -- "$RNA_DARLIN_ACTIVE_LOCK"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 }
 
 rna_darlin_release_transaction_lock() {
@@ -81,6 +83,14 @@ rna_darlin_check_calling_env() {
   "$RNA_DARLIN_CALLING_ENV/bin/Rscript" --vanilla -e 'stopifnot(getRversion() >= "4.5", getRversion() < "4.6", packageVersion("DropletUtils") == "1.30.0")' >/dev/null 2>&1
 }
 
+# HPC 依赖安装在登录节点完成；已有环境可在 allocation 内直接复用。
+rna_darlin_require_login_for_conda() {
+  if [[ "$(uname -s)" == Linux && -n "${SLURM_JOB_ID:-}" ]]; then
+    echo "ERROR: Conda 构建/发布须在登录节点执行: bash core/doctor.sh conda；完成后在现有 Jupyter Terminal 重跑 Doctor。" >&2
+    return 2
+  fi
+}
+
 # R 原生依赖仅在候选环境构建；成功核验后原子更新 calling 指针。
 rna_darlin_setup_calling() {
   local conda_bin="${RNA_DARLIN_CONTROL_ENV}/bin/conda"
@@ -95,6 +105,7 @@ rna_darlin_setup_calling() {
     "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus prepare-droplet-whitelist
     return
   fi
+  rna_darlin_require_login_for_conda
   [[ -x "$conda_bin" ]] || { echo "ERROR: control Conda is required" >&2; return 127; }
   rna_darlin_transaction_lock calling
   local candidate spec
@@ -200,7 +211,7 @@ PY
 }
 
 # 环境构建采用 candidate -> smoke -> current 原子指针；失败候选不污染当前环境。
-rna_darlin_setup_conda() {
+rna_darlin_setup_conda() (
   local update=0 conda_bin=""
   while (($#)); do
     case "$1" in
@@ -214,6 +225,7 @@ rna_darlin_setup_conda() {
     echo "受管环境可用；使用 --update 可原子重建。"
     return 0
   fi
+  rna_darlin_require_login_for_conda
   [[ -n "$conda_bin" ]] || conda_bin="$(command -v conda 2>/dev/null || true)"
   [[ -n "$conda_bin" && -x "$conda_bin" ]] || { echo "ERROR: modern Conda not found; pass --conda PATH." >&2; return 127; }
   local version major
@@ -256,11 +268,10 @@ PY
   trap - EXIT
   rna_darlin_release_transaction_lock
   echo "Activated environment generation: $generation"
-}
+)
 
 # Atlas asset 不进入 Snakemake DAG；doctor 统一准备，run_pipeline 仅要求 control/rules。
 rna_darlin_check_atlas_assets() {
-  rna_darlin_check_atlas_env || return 1
   [[ -s "$RNA_DARLIN_ATLAS_MODEL" ]] || { echo "缺失: $RNA_DARLIN_ATLAS_MODEL" >&2; return 1; }
   [[ "$(wc -c < "$RNA_DARLIN_ATLAS_MODEL" | tr -d ' ')" == "$RNA_DARLIN_ATLAS_MODEL_SIZE" ]] || { echo "ERROR: Census scVI model size mismatch" >&2; return 1; }
   "$RNA_DARLIN_ATLAS_ENV/bin/python" - <<'PY'
@@ -271,39 +282,99 @@ print("CELLxGENE Census 2025-11-08: PASS")
 PY
 }
 
+rna_darlin_setup_ontology() {
+  "$RNA_DARLIN_ATLAS_ENV/bin/python" - "${1:-prepare}" "$RNA_DARLIN_PIPELINE_ROOT/resources/hg38_reference/cell_ontology/cl-basic.obo" <<'PYONTOLOGY'
+import os, sys, tempfile
+from pathlib import Path
+from urllib.request import urlretrieve
+from lemmus.downstream.annotation_human import CELL_ONTOLOGY_URL, _parse_obo
+mode, target = sys.argv[1], Path(sys.argv[2])
+def validate(path):
+    parents, names = _parse_obo(path)
+    if names.get('CL:0000000') != 'cell' or not parents:
+        raise ValueError(f'Invalid Cell Ontology: {path}')
+if target.is_file():
+    validate(target)
+elif mode == 'check':
+    raise FileNotFoundError(f'Missing Cell Ontology: {target}')
+else:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.ontology.', dir=target.parent) as work:
+        candidate=Path(work)/target.name
+        urlretrieve(CELL_ONTOLOGY_URL, candidate)
+        validate(candidate)
+        os.replace(candidate, target)
+print('Cell Ontology: PASS')
+PYONTOLOGY
+}
+
 rna_darlin_setup_atlas() {
   local check=0
   [[ "${1:-}" == --check ]] && { check=1; shift; }
   (($#==0)) || { usage >&2; return 2; }
-  if (( check )); then rna_darlin_check_atlas_assets; return; fi
   rna_darlin_check_atlas_env || { echo "ERROR: atlas environment incomplete; run doctor.sh conda" >&2; return 127; }
-  if [[ ! -s "$RNA_DARLIN_ATLAS_MODEL" ]]; then
+  if (( check )); then rna_darlin_setup_ontology check; rna_darlin_check_atlas_assets; return; fi
+  rna_darlin_prepare_atlas_assets
+}
+
+# 完整 Doctor 已核验环境；资产准备不重复导入整套 atlas 科学依赖。
+rna_darlin_prepare_atlas_assets() {
+  rna_darlin_setup_ontology
+  if [[ ! -s "$RNA_DARLIN_ATLAS_MODEL" || "$(wc -c < "$RNA_DARLIN_ATLAS_MODEL" | tr -d ' ')" != "$RNA_DARLIN_ATLAS_MODEL_SIZE" ]]; then
     mkdir -p "$(dirname "$RNA_DARLIN_ATLAS_MODEL")"
-    local tmp="$RNA_DARLIN_ATLAS_MODEL.part.$$"
-    rm -f -- "$tmp"
+    rna_darlin_transaction_lock atlas
+    local tmp
+    tmp="$(mktemp "$RNA_DARLIN_ATLAS_MODEL.part.XXXXXXXX")"
+    RNA_DARLIN_ACTIVE_CANDIDATE="$tmp"
     PATH="$RNA_DARLIN_ATLAS_ENV/bin:$PATH" "$RNA_DARLIN_ATLAS_ENV/bin/aws" s3 cp --no-sign-request --no-progress --only-show-errors \
       s3://cellxgene-contrib-public/models/scvi/2025-11-08/homo_sapiens/model.pt "$tmp"
     [[ "$(wc -c < "$tmp" | tr -d ' ')" == "$RNA_DARLIN_ATLAS_MODEL_SIZE" ]] || { rm -f -- "$tmp"; echo "ERROR: downloaded model size mismatch" >&2; return 1; }
     mv "$tmp" "$RNA_DARLIN_ATLAS_MODEL"
+    RNA_DARLIN_ACTIVE_CANDIDATE=""
+    rna_darlin_release_transaction_lock
   fi
   rna_darlin_check_atlas_assets
+}
+
+# 固定视图只提交已验证候选；旧目录保留，提交失败立即恢复，不递归删除共享参考。
+rna_darlin_publish_reference() {
+  local candidate="$1" target="$2" previous="" status
+  # mktemp 候选在构建期间私有；发布时恢复当前 umask 的目录权限。
+  if [[ ! -L "$candidate" ]]; then chmod "$(umask -S)" "$candidate"; fi
+  if [[ -e "$target" || -L "$target" ]]; then
+    previous="$(mktemp -d "${target}.previous.XXXXXXXX")"
+    rmdir "$previous"
+    mv -- "$target" "$previous"
+  fi
+  if mv -- "$candidate" "$target"; then
+    [[ -z "$previous" ]] || echo "保留原 reference: $previous"
+  else
+    status=$?
+    if [[ -n "$previous" ]]; then
+      mv -- "$previous" "$target" || echo "ERROR: reference 回滚失败；保留于 $previous" >&2
+    fi
+    return "$status"
+  fi
 }
 
 # RNA reference 使用 simpleaf 构建 splici + piscem index；一次构建，多项目共享。
 rna_darlin_setup_reference() {
   (($#>=1)) || { usage >&2; return 2; }
   local species="$1"; shift
+  case "$species" in hg38|mm10) ;; *) echo "ERROR: supported reference species: hg38, mm10" >&2; return 2 ;; esac
   local source_dir="" fasta="" gtf="" mode=copy
   while (($#)); do
     case "$1" in
-      --source) source_dir="$2"; shift 2 ;;
-      --fasta) fasta="$2"; shift 2 ;;
-      --gtf) gtf="$2"; shift 2 ;;
+      --source) (($#>=2)) && [[ -n "$2" ]] || { usage >&2; return 2; }; source_dir="$2"; shift 2 ;;
+      --fasta) (($#>=2)) && [[ -n "$2" ]] || { usage >&2; return 2; }; fasta="$2"; shift 2 ;;
+      --gtf) (($#>=2)) && [[ -n "$2" ]] || { usage >&2; return 2; }; gtf="$2"; shift 2 ;;
       --link) mode=link; shift ;;
       --copy) mode=copy; shift ;;
       *) echo "ERROR: unsupported reference option: $1" >&2; return 2 ;;
     esac
   done
+  [[ -z "$source_dir" || ( -z "$fasta" && -z "$gtf" ) ]] || { echo "ERROR: --source cannot be combined with --fasta/--gtf" >&2; return 2; }
+  [[ "$mode" != link || -n "$source_dir" ]] || { echo "ERROR: --link requires --source" >&2; return 2; }
   local resource_root target candidate required
   resource_root="$RNA_DARLIN_PIPELINE_ROOT/resources"
   mkdir -p "$resource_root/${species}_reference"
@@ -328,14 +399,18 @@ rna_darlin_setup_reference() {
     for required in genome.fa genes/genes.gtf simpleaf/ref/t2g.tsv; do [[ -s "$source_dir/$required" ]] || { echo "ERROR: source reference lacks $required" >&2; return 1; }; done
     compgen -G "$source_dir/simpleaf/index/piscem_idx*" >/dev/null || { echo "ERROR: source reference lacks piscem index" >&2; return 1; }
     "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus rna-reference check --species "$species" --path "$source_dir"
-    if [[ "$mode" == link && ! -e "$target" ]]; then ln -s "$source_dir" "$target"; else
-      candidate="$resource_root/${species}_reference.building.$$"; RNA_DARLIN_ACTIVE_CANDIDATE="$candidate"; rm -rf -- "$candidate"; cp -R "$source_dir" "$candidate"
-      rm -rf -- "$target"; mv "$candidate" "$target"
-    fi
+    candidate="$(mktemp -d "$resource_root/${species}_reference.building.XXXXXXXX")"
+    RNA_DARLIN_ACTIVE_CANDIDATE="$candidate"
+    if [[ "$mode" == link ]]; then rmdir "$candidate"; ln -s "$source_dir" "$candidate"
+    else cp -R "$source_dir/." "$candidate/"; fi
+    "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus rna-reference check --species "$species" --path "$candidate"
+    rna_darlin_publish_reference "$candidate" "$target"
   else
     [[ -n "$fasta" && -n "$gtf" && -s "$fasta" && -s "$gtf" ]] || { echo "ERROR: --fasta and --gtf are required and must be non-empty" >&2; return 2; }
     [[ -x "$RNA_DARLIN_RULE_ENV/bin/simpleaf" ]] || { echo "ERROR: rules environment missing; run doctor.sh conda" >&2; return 127; }
-    candidate="$resource_root/${species}_reference.building.$$"; RNA_DARLIN_ACTIVE_CANDIDATE="$candidate"; rm -rf -- "$candidate"; mkdir -p "$candidate/genes"
+    candidate="$(mktemp -d "$resource_root/${species}_reference.building.XXXXXXXX")"
+    RNA_DARLIN_ACTIVE_CANDIDATE="$candidate"
+    mkdir -p "$candidate/genes"
     cp "$fasta" "$candidate/genome.fa"; cp "$gtf" "$candidate/genes/genes.gtf"
     "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus rna-reference prepare \
       --species "$species" --path "$candidate/rrna_competitor.fa"
@@ -352,7 +427,7 @@ rna_darlin_setup_reference() {
     compgen -G "$candidate/simpleaf/index/piscem_idx*" >/dev/null || { echo "ERROR: simpleaf reference build incomplete: piscem index" >&2; return 1; }
     "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus rna-reference seal --species "$species" --path "$candidate"
     rm -rf "$candidate/.simpleaf_work" "$candidate/.simpleaf_tmp"
-    rm -rf -- "$target"; mv "$candidate" "$target"
+    rna_darlin_publish_reference "$candidate" "$target"
   fi
   RNA_DARLIN_ACTIVE_CANDIDATE=""; rna_darlin_release_transaction_lock
   echo "RNA simpleaf/piscem reference ready: $target"
@@ -360,7 +435,7 @@ rna_darlin_setup_reference() {
 
 # test 只验证当前生产 contract；不恢复已删除 helper、compatibility 或 identity gate。
 rna_darlin_test() (
-  local python="${PYTHON:-$(command -v python3)}" unit_python validated=0 tmp
+  local python="${PYTHON:-$(command -v python3)}" unit_python validated=0 tmp required="${1:-0}"
   unit_python="$python"
   if rna_darlin_check_env >/dev/null 2>&1; then
     python="$RNA_DARLIN_CONTROL_ENV/bin/python"
@@ -400,14 +475,48 @@ PY
   if grep -RInE '(^|[^[:alnum:]_])\.runtime([^[:alnum:]_]|$)' "$RNA_DARLIN_PIPELINE_ROOT/core/Snakefile" "$RNA_DARLIN_PIPELINE_ROOT"/core/lemmus/*.py "$RNA_DARLIN_PIPELINE_ROOT/README.md"; then stale=1; fi
   (( stale == 0 )) || { echo "ERROR: stale production reference found" >&2; return 1; }
   if (( validated )); then
-    local project="$tmp/project"; "$python" -m lemmus parser-fixture --project "$project" >/dev/null
-    if rna_darlin_check_project_reference "$project/00_config/config.yaml" >/dev/null 2>&1; then
-      (cd "$project"; export RNA_DARLIN_CONFIG="$project/00_config/config.yaml" RNA_DARLIN_PROJECT_DIR="$project" RNA_DARLIN_RULE_ENV="$RNA_DARLIN_RULE_ENV"; "$RNA_DARLIN_CONTROL_ENV/bin/snakemake" --snakefile "$RNA_DARLIN_PIPELINE_ROOT/core/Snakefile" --executor local --cores 1 --dry-run --runtime-source-cache-path "$tmp/source-cache" --configfile "$RNA_DARLIN_CONFIG" >/dev/null)
-      echo "Snakemake full-DAG dry-run: PASS"
-    else
-      echo "Snakemake full-DAG dry-run: SKIPPED (shared Pipeline reference unavailable)"
-    fi
+    # 每个 case 建独立 Workflow；同一解释器复用 Snakemake/NumPy/Pandas 导入。
+    "$python" - "$RNA_DARLIN_PIPELINE_ROOT" "$tmp" "$required" "$RNA_DARLIN_RULE_ENV" <<'PYDAG'
+import contextlib, io, os, sys
+from pathlib import Path
+import yaml
+from lemmus.config import load_config
+from lemmus.maintenance import parser_fixture_main
+from lemmus.rna import validate_rna_reference
+from snakemake.cli import main
+root, tmp, required, rule_env = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+original = Path.cwd()
+diagnostics=io.StringIO()
+with open(os.devnull, 'w') as sink:
+    for species in ('hg38', 'mm10'):
+        for protocol in ('cabernet', 'droplet'):
+            project=tmp/f'{species}-{protocol}'
+            with contextlib.redirect_stdout(sink):parser_fixture_main(['--project', str(project)])
+            path=project/'00_config/config.yaml';config=yaml.safe_load(path.read_text())
+            config['pipeline_mode']=protocol;config[protocol]['RNA']['reference']=species
+            path.write_text(yaml.safe_dump(config, sort_keys=False))
+            # 使用同一生产配置解析器；schema/输入错误不能冒充 reference 缺失。
+            active=load_config(path)
+            try:validate_rna_reference(root/f"resources/{active['RNA']['reference']}_reference/pg45s", species)
+            except (OSError, ValueError):
+                if required:raise
+                print(f'Snakemake full-DAG dry-run ({species} / {protocol}): SKIPPED (shared Pipeline reference unavailable)')
+                continue
+            os.environ.update(RNA_DARLIN_CONFIG=str(path), RNA_DARLIN_PROJECT_DIR=str(project), RNA_DARLIN_RULE_ENV=rule_env, RNA_DARLIN_PROTOCOL=protocol)
+            try:
+                os.chdir(project)
+                diagnostic_start=diagnostics.tell()
+                with contextlib.redirect_stdout(diagnostics):
+                    try:main(['--snakefile',str(root/'core/Snakefile'),'--executor','local','--cores','1','--dry-run','--runtime-source-cache-path',str(tmp/'source-cache'),'--configfile',str(path)])
+                    except SystemExit as exc:
+                        if exc.code not in (None,0):
+                            print(diagnostics.getvalue()[diagnostic_start:], file=sys.stderr, end='')
+                            raise
+            finally:os.chdir(original)
+            print(f'Snakemake full-DAG dry-run ({species} / {protocol}): PASS')
+PYDAG
   else
+    if (( required )); then echo "ERROR: full-DAG requires managed environments" >&2; return 1; fi
     echo "Snakemake full-DAG dry-run: SKIPPED (managed environment unavailable)"
   fi
   echo "[6/6] Alopex cross-pipeline alignment (cabernet / droplet)"
@@ -437,6 +546,34 @@ rna_darlin_check_pipeline_alignment() {
   "$python" -m lemmus cross-pipeline-check
 }
 
+# 子进程保持独立 errexit；网络失败不妨碍其它物种/reference 与安装自检完成。
+rna_darlin_all() {
+  local status=0 species started=$SECONDS
+  bash "$RNA_DARLIN_PIPELINE_ROOT/core/doctor.sh" conda
+  echo "Doctor phase environments: $((SECONDS-started))s"
+  for species in hg38 mm10; do
+    started=$SECONDS
+    if bash "$RNA_DARLIN_PIPELINE_ROOT/core/doctor.sh" reference "$species"; then :
+    else echo "ERROR: $species reference 准备失败" >&2; status=1; fi
+    echo "Doctor phase reference $species: $((SECONDS-started))s"
+  done
+  started=$SECONDS
+  if bash -c 'source "$1"; rna_darlin_test 1' -- "$RNA_DARLIN_PIPELINE_ROOT/core/doctor.sh"; then :
+  else echo "ERROR: 安装自检失败" >&2; status=1; fi
+  echo "Doctor phase test: $((SECONDS-started))s"
+  if [[ -f "$PWD/00_config/config.yaml" ]]; then
+    # 项目配置只读；失败必须阻止 READY。
+    if (set -e; rna_darlin_check_project_reference "$PWD/00_config/config.yaml"); then :
+    else echo "ERROR: 当前项目 reference 检查失败" >&2; status=1; fi
+  fi
+  started=$SECONDS
+  if bash -c 'source "$1"; rna_darlin_prepare_atlas_assets' -- "$RNA_DARLIN_PIPELINE_ROOT/core/doctor.sh"; then :
+  else echo "ERROR: Atlas 资源/API 准备失败" >&2; status=1; fi
+  echo "Doctor phase atlas assets/API: $((SECONDS-started))s"
+  (( status == 0 )) || return "$status"
+  echo "Lemmus Doctor: READY (control/rules/atlas/calling, hg38/mm10 PG+45S, ME5, protocol DAGs)"
+}
+
 # 被 source 时只提供共享清单与函数；不解析参数、不执行维护动作。
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
   return 0
@@ -446,17 +583,14 @@ case "${1:-all}" in
   -h|--help|help) usage ;;
   conda)
     shift
-    if [[ "${1:-}" == --check ]]; then shift; (($#==0)) || { usage >&2; exit 2; }; rna_darlin_check_all_env
-    else rna_darlin_setup_conda "$@"; fi ;;
+    if [[ "${1:-}" == --check ]]; then shift; (($#==0)) || { usage >&2; exit 2; }; rna_darlin_check_all_env; rna_darlin_setup_calling --check
+    else rna_darlin_setup_conda "$@"; rna_darlin_setup_calling; fi ;;
   atlas) shift; rna_darlin_setup_atlas "$@" ;;
   calling) shift; rna_darlin_setup_calling "$@" ;;
   reference) shift; rna_darlin_setup_reference "$@" ;;
   test) shift; (($#==0)) || { usage >&2; exit 2; }; rna_darlin_test ;;
   all)
     (($#==0)) || { usage >&2; exit 2; }
-    if ! rna_darlin_check_all_env; then echo "环境不完整；尝试构建。"; rna_darlin_setup_conda; fi
-    rna_darlin_setup_atlas
-    rna_darlin_test
-    [[ -f "$PWD/00_config/config.yaml" ]] && rna_darlin_check_project_reference "$PWD/00_config/config.yaml" || true ;;
+    rna_darlin_all ;;
   *) usage >&2; exit 2 ;;
 esac

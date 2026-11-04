@@ -44,6 +44,7 @@ calling:
   dependencies:
   - python=3.12
   - cutadapt=5.2
+  - curl
   - numpy>=2,<3
   - pandas>=2.2,<4
   - pyyaml>=6,<7

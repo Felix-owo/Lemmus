@@ -62,7 +62,10 @@ def prepare_calling_main(argv=None):
     parser.add_argument('--conda', type=Path, required=True)
     args = parser.parse_args(argv)
     code = r'''
-options(repos=c(CRAN="https://cloud.r-project.org"), timeout=1200, Ncpus=4)
+# 外部 curl 逐包下载，避免 libcurl 批量连接全部耗尽超时；HTTP错误必须失败。
+stopifnot(nzchar(Sys.which("curl")))
+options(repos=c(CRAN="https://cloud.r-project.org"), timeout=1200, Ncpus=4,
+        download.file.method="curl", download.file.extra=c("-fL", "--max-time", "1200"))
 stopifnot(getRversion() >= "4.5", getRversion() < "4.6")
 if (!requireNamespace("DropletUtils", quietly=TRUE)) {
     BiocManager::install(version="3.22", ask=FALSE, update=FALSE)

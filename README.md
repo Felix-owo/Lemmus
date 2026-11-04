@@ -1,12 +1,12 @@
 # Lemmus
 
-当前版本为Git tag `v5.10`，正式发行包以包内README为准。源码计算位于`core/lemmus/`，下游实现归其`downstream/`子包，顶层`downstream/`只承载Notebook。
+当前版本为Git tag `v5.11`，正式发行包以包内README为准。源码计算位于`core/lemmus/`，下游实现归其`downstream/`子包，顶层`downstream/`只承载Notebook。
 
 Cabernet和Droplet都固定使用 **PG（parsimony-gene）＋物种对应45S竞争参考**。PG拒绝残余多gene歧义，不运行EM，也不将原始分子数取整。支持hg38（人NR_146144.1）与mm10（小鼠NR_046233.2），固定序列及来源见 [45S参考](resources/rrna/README.md)。技术feature `RRNA45S_COMPETITOR` 的计数单独保存在obs/uns；`biological.h5ad`、细胞调用及下游表达不含该feature。它不是生物学单拷贝gene；零技术计数不能证明没有rRNA污染。
 
 本版本采用上述策略；已有其它resolution配置需在Pipeline外明确调整，旧index须用Doctor重建，历史结果不自动重算或覆盖。
 
-Lemmus v5.10（原 RNA_DARLIN_Pipeline）是从 Camellia 拆出的独立 RNA + targeted DARLIN workflow，基于 Snakemake。它可以完成：
+Lemmus v5.11（原 RNA_DARLIN_Pipeline）是从 Camellia 拆出的独立 RNA + targeted DARLIN workflow，基于 Snakemake。它可以完成：
 
 - RNA：Cabernet 3′ 与 DD-MET5 Droplet RNA 独立调用和定量（simpleaf 单一 backend）；
 - DARLIN：targeted lineage barcode 的 streaming 提取、UMI 级等位基因共识与 directional clone denoising；
@@ -44,18 +44,18 @@ Cabernet RNA 路径按标准 TSO-based 3′ UMI scRNA-seq 处理，不再保留 
 
 ## 1. 从 GitHub 下载 Pipeline
 
-从 [v5.10 Release](https://github.com/Felix-owo/Lemmus/releases/tag/v5.10) 下载 `Lemmus-v5.10.tar.gz` 和 `SHA256SUMS`，校验后解压：
+从 [v5.11 Release](https://github.com/Felix-owo/Lemmus/releases/tag/v5.11) 下载 `Lemmus-v5.11.tar.gz` 和 `SHA256SUMS`，校验后解压：
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Lemmus-v5.10.tar.gz
-cd Lemmus-v5.10
+tar -xzf Lemmus-v5.11.tar.gz
+cd Lemmus-v5.11
 ```
 
 也可使用正式 tag 获取代码：
 
 ```bash
-git clone --branch v5.10 --single-branch https://github.com/Felix-owo/Lemmus.git
+git clone --branch v5.11 --single-branch https://github.com/Felix-owo/Lemmus.git
 cd Lemmus
 ```
 
@@ -66,11 +66,11 @@ cd Lemmus
 - `git` 与 `curl`；
 - HPC 上可以使用 `sbatch` 和 `squeue`。
 
-不要跨机器复制已经构建的 `conda/` 或 reference index；在目标机器上让 Doctor 构建。
+不要跨机器复制已经构建的 `conda/`。reference 按下述标准顺序在本机核验后上传；缺失时由目标机器的 Doctor 从明确的原始输入构建。
 
 ## 2. 准备标准 reference
 
-RNA reference 由 genome FASTA + GTF 构建。Pipeline 不会自动下载原始 reference；首次构建前准备好目标物种的 FASTA 与 GTF，然后交给 Doctor：
+RNA reference 由 genome FASTA + GTF 构建。与 Alopex 一样，Pipeline 不自动下载原始 reference。将解压后的标准输入放在 `resources/reference_source/`：`hg38.fa`、`hg38.genes.gtf`（GENCODE v48）、`mm10.fa`、`mm10.genes.gtf`（GENCODE M25）。FASTA/GTF 必须来自同一装配；无参 Doctor 会复用已就绪参考，或从这些输入构建缺失的两套 PG＋45S 参考。也可显式构建单一物种：
 
 ```bash
 core/doctor.sh reference mm10 --fasta /path/mm10.fa --gtf /path/mm10.gtf
@@ -88,6 +88,8 @@ resources/<species>_reference/pg45s/
     └── index/piscem_idx*
 ```
 
+构建失败保留本次候选和旧参考；发布失败恢复旧目标。不会清理父目录中的旧索引、Census 或 ontology。
+
 reference readiness 检查 FASTA、GTF、固定45S序列、两列t2g、piscem index和竞争设计标记；不检查、也不构建 STAR index。`simpleaf/ref/t2g.tsv` 固定为两列 transcript→gene map，输出普通 gene×cell 矩阵；不默认使用三列 USA t2g（USA 输出语义不同且 resolution 约束不同）。
 
 项目 config 只通过 `RNA.reference` 选择 species；生产 reference 固定解析为 Pipeline 根目录的 `resources/<species>_reference/pg45s/`，项目配置不能覆盖 `reference_dir`、`simpleaf_reference`、`genome_fasta` 或 `gtf` 路径，`--init-project` 也不会创建项目级 `resources/`。
@@ -100,12 +102,17 @@ HPC 标准顺序与 Alopex 一致：
 2. 在登录节点提前下载和准备 Conda 等依赖。Lemmus 需要安装环境时使用 `bash core/doctor.sh conda`；已有正确环境直接复用，不因源码更新重复安装。
 3. 在**现有 JupyterLab 的 Terminal** 中进入 Pipeline 根目录，运行 `bash core/doctor.sh`。完整 Doctor 与科学调用在 Jupyter 的原 allocation 中执行，不在登录节点运行，不另起独立 Doctor allocation。
 
-普通部署只要求更新 Pipeline 后跑通标准 Doctor，不默认追加全仓开发回归或额外 benchmark。
+普通部署只要求更新 Pipeline 后跑通标准 Doctor，不默认追加全仓开发回归或额外 benchmark。代理日志、沙箱和备份统一留在已授权的 `MethylTreeAgent` 工作根。
+
+无参 Doctor 准备 control/rules/atlas/calling 四个受管环境、固定 ME5 白名单、hg38/mm10 PG＋45S 参考、Census scVI model 与 Cell Ontology，再检查 Cabernet/Droplet × hg38/mm10 四个完整 DAG、跨 Pipeline 身份和当前目录项目的参考。各阶段失败均非零退出，缺 reference 不再作为完整 Doctor 的跳过项；Atlas API 故障不会阻止独立 reference 和自检阶段完成。配置模板只读，不修改已有项目配置或科学结果。
+
+Conda 构建/发布仅在 HPC 登录节点执行；allocation 内可复用已就绪环境，缺环境时给出登录节点准备命令。Census 查询仍需要运行节点能够访问官方服务，下载模型不能代替在线 API 可用性。
 
 分段维护命令如下；环境准备在登录节点，验证在 Jupyter 中执行：
 
 ```bash
-core/doctor.sh conda          # 构建/更新受管 Conda 环境
+core/doctor.sh conda          # 准备四个受管环境和固定 ME5 白名单
+core/doctor.sh conda --check  # 只读检查环境和白名单
 core/doctor.sh test           # 编译、配置/schema、运行自检与可用的full-DAG dry-run
 ```
 
@@ -113,7 +120,7 @@ rules 环境至少提供：Python、simpleaf、piscem、alevin-fry、umi_tools�
 
 Doctor 下载 Census model 时使用 atlas 环境自己的 AWS CLI 与 Python，不依赖登录 shell 的 Python。
 
-`core/doctor.sh test` 不依赖Git或开发测试目录：执行Python compile、Shell语法、配置/schema、barcode纠正与整数H5AD写读自检；受管环境和reference存在时还执行Snakemake full-DAG dry-run。自检使用临时合成输入，不能替代原始数据的科学验收。完整开发回归由私有开发仓库维护。
+`core/doctor.sh test` 不依赖Git或开发测试目录：执行Python compile、Shell语法、配置/schema、barcode纠正与整数H5AD写读自检；受管环境和reference存在时还执行两物种×两协议的Snakemake full-DAG dry-run；单独 test 缺依赖可明确跳过，无参 Doctor 要求全部四项通过。自检使用临时合成输入，不能替代原始数据的科学验收。
 
 `doctor.sh test` 的末步只读核对同级 `../Alopex`（可用 `DNA_PIPELINE_ROOT` 指定实际安装根目录）：Cabernet 比较两个 `resources/Barcode_Map.csv` 的 `(PlateID, RNA_Barcode, Cell_Order)` 字符串投影；使用 CSV 解析，表头去 BOM/外围空白并忽略大小写，拒绝空表、重复身份和损坏行。Droplet 比较 Lemmus `resources/droplet/U3CB_methylation.txt.gz` 与 Alopex `resources/droplet_ME5_U3CB_methylation.txt.gz`，两者必须匹配固定 ME5 SHA256。默认 Alopex 未安装时告警并标记未验证；显式根目录为空/不存在、已安装 Alopex 缺少孔板表、映射冲突或已有设计文件损坏均失败。Droplet 设计尚未准备时仅该项告警未验证（Lemmus 使用 `doctor.sh calling` 准备）；检查不构建环境、不运行 DNA doctor、不修改两侧资源。
 
