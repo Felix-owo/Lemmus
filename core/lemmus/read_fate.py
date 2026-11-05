@@ -1,5 +1,6 @@
 """Lemmus：read-fate 证据与磁盘守恒索引。"""
 from __future__ import annotations
+from .io import project_temporary_parent, atomic_output
 
 import argparse
 import csv
@@ -539,7 +540,7 @@ def validate_ledger_bundle(tsv: Path, summary_json: Path, checksum_path: Path) -
 def write_outputs(rows: Sequence[FateRow], output_tsv: Path, summary_json: Path, checksum_path: Path, source_status: Mapping[str, Mapping[str, str]] | None=None) -> dict[str, object]:
     """Write an in-memory conformance result through the production disk store."""
     output_tsv.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='.read-fate-store-', dir=output_tsv.parent) as temporary:
+    with tempfile.TemporaryDirectory(prefix='.read-fate-store-', dir=project_temporary_parent(output_tsv)) as temporary:
         with SqliteFateStore(Path(temporary) / 'fates.sqlite') as store:
             for row in rows:
                 store.insert(row)
@@ -551,57 +552,52 @@ def write_store_outputs(store: SqliteFateStore, output_tsv: Path, summary_json: 
     output_tsv.parent.mkdir(parents=True, exist_ok=True)
     summary_json.parent.mkdir(parents=True, exist_ok=True)
     checksum_path.parent.mkdir(parents=True, exist_ok=True)
-    tsv_tmp = output_tsv.with_name(output_tsv.name + '.tmp')
-    with tsv_tmp.open('w', newline='', encoding='utf-8') as handle:
-        writer = csv.DictWriter(handle, fieldnames=TSV_COLUMNS, delimiter='\t', lineterminator='\n')
-        writer.writeheader()
-        writer.writerows((row.as_dict() for row in store.rows()))
-    digest = sha256_file(tsv_tmp)
-    counts = store.count_by('fate')
-    sample_counts = store.count_by('sample_id')
-    modality_counts = store.count_by('modality')
-    total_rows = store.total()
-    statuses = {modality: {'status': 'wired' if modality_counts.get(modality, 0) else 'not_selected', 'detail': 'per-read evidence present' if modality_counts.get(modality, 0) else 'modality was not selected for this ledger'} for modality in sorted(FATES_BY_MODALITY)}
-    if source_status:
-        for modality, status in source_status.items():
-            if modality not in FATES_BY_MODALITY:
-                raise ReadFateError(f'Source status uses unsupported modality: {modality}')
-            statuses[modality] = dict(status)
-    wired_modalities = {modality for modality, status in statuses.items() if status.get('status') == 'wired'}
-    selected_modalities = {modality for modality, status in statuses.items() if status.get('status') in {'wired', 'not_wired'}}
-    invalid_statuses = {modality: status.get('status') for modality, status in statuses.items() if status.get('status') not in {'wired', 'not_wired', 'not_selected'}}
-    if invalid_statuses:
-        raise ReadFateError(f'Invalid source status values: {invalid_statuses}')
-    for modality, count in modality_counts.items():
-        if count and modality not in wired_modalities:
-            raise ReadFateError(f'Read-fate rows exist for {modality}, but its source is marked not_wired')
-    if selected_modalities and wired_modalities == selected_modalities:
-        coverage_status = 'complete'
-        global_conservation_status = 'passed'
-        globally_conserved = True
-    elif wired_modalities:
-        coverage_status = 'partial'
-        global_conservation_status = 'partial'
-        globally_conserved = None
-    else:
-        coverage_status = 'not_assessed'
-        global_conservation_status = 'not_assessed'
-        globally_conserved = None
-    branch_conservation = {}
-    for modality in sorted(FATES_BY_MODALITY):
-        count = modality_counts.get(modality, 0)
-        wired = modality in wired_modalities
-        branch_conservation[modality] = {'status': 'passed' if wired else 'not_assessed', 'input_read_pairs': count if wired else None, 'output_rows': count if wired else None, 'conserved': True if wired else None}
-    summary: dict[str, object] = {'schema_version': SCHEMA_VERSION, 'kind': 'rna_darlin_read_fate_summary', 'coverage_status': coverage_status, 'selected_modalities': sorted(selected_modalities), 'tsv': {'path': output_tsv.name, 'columns': list(TSV_COLUMNS), 'sha256': digest}, 'conservation': {'status': global_conservation_status, 'input_read_pairs': total_rows, 'output_rows': total_rows, 'missing_fates': 0, 'duplicate_fates': 0, 'conflicting_fates': 0, 'mate_id_mismatches': 0, 'conserved': globally_conserved}, 'branch_conservation': branch_conservation, 'sample_counts': sample_counts, 'modality_counts': modality_counts, 'fate_counts': counts, 'source_status': statuses}
-    summary_tmp = summary_json.with_name(summary_json.name + '.tmp')
-    summary_tmp.write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n', encoding='utf-8')
-    checksum_tmp = checksum_path.with_name(checksum_path.name + '.tmp')
-    checksum_tmp.write_text(f'{digest}  {output_tsv.name}\n', encoding='utf-8')
-    checksum_path.unlink(missing_ok=True)
-    summary_json.unlink(missing_ok=True)
-    tsv_tmp.replace(output_tsv)
-    summary_tmp.replace(summary_json)
-    checksum_tmp.replace(checksum_path)
+    with atomic_output(checksum_path) as checksum_tmp, atomic_output(summary_json) as summary_tmp, atomic_output(output_tsv) as tsv_tmp:
+        with tsv_tmp.open('w', newline='', encoding='utf-8') as handle:
+            writer = csv.DictWriter(handle, fieldnames=TSV_COLUMNS, delimiter='\t', lineterminator='\n')
+            writer.writeheader()
+            writer.writerows((row.as_dict() for row in store.rows()))
+        digest = sha256_file(tsv_tmp)
+        counts = store.count_by('fate')
+        sample_counts = store.count_by('sample_id')
+        modality_counts = store.count_by('modality')
+        total_rows = store.total()
+        statuses = {modality: {'status': 'wired' if modality_counts.get(modality, 0) else 'not_selected', 'detail': 'per-read evidence present' if modality_counts.get(modality, 0) else 'modality was not selected for this ledger'} for modality in sorted(FATES_BY_MODALITY)}
+        if source_status:
+            for modality, status in source_status.items():
+                if modality not in FATES_BY_MODALITY:
+                    raise ReadFateError(f'Source status uses unsupported modality: {modality}')
+                statuses[modality] = dict(status)
+        wired_modalities = {modality for modality, status in statuses.items() if status.get('status') == 'wired'}
+        selected_modalities = {modality for modality, status in statuses.items() if status.get('status') in {'wired', 'not_wired'}}
+        invalid_statuses = {modality: status.get('status') for modality, status in statuses.items() if status.get('status') not in {'wired', 'not_wired', 'not_selected'}}
+        if invalid_statuses:
+            raise ReadFateError(f'Invalid source status values: {invalid_statuses}')
+        for modality, count in modality_counts.items():
+            if count and modality not in wired_modalities:
+                raise ReadFateError(f'Read-fate rows exist for {modality}, but its source is marked not_wired')
+        if selected_modalities and wired_modalities == selected_modalities:
+            coverage_status = 'complete'
+            global_conservation_status = 'passed'
+            globally_conserved = True
+        elif wired_modalities:
+            coverage_status = 'partial'
+            global_conservation_status = 'partial'
+            globally_conserved = None
+        else:
+            coverage_status = 'not_assessed'
+            global_conservation_status = 'not_assessed'
+            globally_conserved = None
+        branch_conservation = {}
+        for modality in sorted(FATES_BY_MODALITY):
+            count = modality_counts.get(modality, 0)
+            wired = modality in wired_modalities
+            branch_conservation[modality] = {'status': 'passed' if wired else 'not_assessed', 'input_read_pairs': count if wired else None, 'output_rows': count if wired else None, 'conserved': True if wired else None}
+        summary: dict[str, object] = {'schema_version': SCHEMA_VERSION, 'kind': 'rna_darlin_read_fate_summary', 'coverage_status': coverage_status, 'selected_modalities': sorted(selected_modalities), 'tsv': {'path': output_tsv.name, 'columns': list(TSV_COLUMNS), 'sha256': digest}, 'conservation': {'status': global_conservation_status, 'input_read_pairs': total_rows, 'output_rows': total_rows, 'missing_fates': 0, 'duplicate_fates': 0, 'conflicting_fates': 0, 'mate_id_mismatches': 0, 'conserved': globally_conserved}, 'branch_conservation': branch_conservation, 'sample_counts': sample_counts, 'modality_counts': modality_counts, 'fate_counts': counts, 'source_status': statuses}
+        summary_tmp.write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+        checksum_tmp.write_text(f'{digest}  {output_tsv.name}\n', encoding='utf-8')
+        checksum_path.unlink(missing_ok=True)
+        summary_json.unlink(missing_ok=True)
     return summary
 
 
@@ -665,7 +661,7 @@ def read_fate_main(argv: Sequence[str] | None=None) -> int:
         if 'DARLIN' in wired_modalities:
             source_status['DARLIN'] = {'status': 'wired', 'detail': 'raw paired FASTQ conserved against complete per-template DARLIN sidecars with deterministic cross-template consensus'}
     args.output_tsv.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='.read-fate-store-', dir=args.output_tsv.parent) as temporary:
+    with tempfile.TemporaryDirectory(prefix='.read-fate-store-', dir=project_temporary_parent(args.output_tsv)) as temporary:
         with SqliteFateStore(Path(temporary) / 'fates.sqlite') as store:
             if args.command == 'collect':
                 inventory = inventory_from_fastq(args.sample_id, args.modality, args.raw_r1, args.raw_r2)

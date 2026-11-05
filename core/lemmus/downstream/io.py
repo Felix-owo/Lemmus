@@ -4,7 +4,6 @@ from __future__ import annotations
 import fcntl
 import stat as _qc_lock_stat
 import threading
-import uuid
 from contextlib import ExitStack, contextmanager
 
 import hashlib
@@ -13,34 +12,23 @@ import os
 from pathlib import Path
 import pandas as pd
 from .config import DownstreamQCError
+from ..io import atomic_output
 
 
-@contextmanager
-def _atomic_output(path: Path):
-    """临时文件独占创建在目标同一目录，保留原umask并只清理本次候选。"""
-    path = Path(path)
-    temporary = path.with_name(f".{path.name}.tmp.{uuid.uuid4().hex}")
-    descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
-    try:
-        os.close(descriptor)
-        yield temporary
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def atomic_write_bytes(data: bytes, destination: Path) -> None:
-    with _atomic_output(destination) as temporary:
+    with atomic_output(destination) as temporary:
         temporary.write_bytes(data)
 
 
 def atomic_write_csv(frame: pd.DataFrame, path: Path, *, index: bool = False) -> None:
-    with _atomic_output(path) as temporary:
+    with atomic_output(path) as temporary:
         frame.to_csv(temporary, index=index)
 
 
 def atomic_write_json(payload: dict, path: Path) -> None:
-    with _atomic_output(path) as temporary:
+    with atomic_output(path) as temporary:
         temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
@@ -92,7 +80,7 @@ def sanitize_for_h5ad(adata):
 
 def atomic_write_h5ad(adata, destination: Path) -> None:
     """只提交本次调用的完整H5AD；失败保留已有结果并清理私有候选。"""
-    with _atomic_output(destination) as temporary:
+    with atomic_output(destination) as temporary:
         adata.write_h5ad(temporary)
 
 

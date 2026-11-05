@@ -1,5 +1,6 @@
 """Lemmus：RNA calling、原生计数与项目细胞身份。"""
 from __future__ import annotations
+from .io import project_temporary_parent, atomic_output
 
 import argparse
 import hashlib
@@ -83,7 +84,8 @@ def call_droplet_rna(input_h5ad: Path, calls: Path, qc: Path, rscript: Path) -> 
     if matrix.data.size == 0 or not np.isfinite(matrix.data).all() or (matrix.data < 0).any():
         raise ValueError('emptyDrops requires a finite nonnegative, nonempty background matrix')
     started = time.monotonic()
-    with tempfile.TemporaryDirectory(prefix='.emptydrops.', dir=calls.parent) as tmp:
+    project_temporary_parent(qc)
+    with tempfile.TemporaryDirectory(prefix='.emptydrops.', dir=project_temporary_parent(calls)) as tmp:
         folder = Path(tmp)
         mmwrite(folder/'counts.mtx', matrix, precision=17)
         (folder/'barcodes.txt').write_text('\n'.join(map(str, adata.obs_names))+'\n')
@@ -349,7 +351,7 @@ def export_rna_counts(quant_dir: Path, gene_map: Path, output_h5ad: Path) -> Non
                              ('quant_info', 'quant.json'), ('simpleaf_map_info', 'simpleaf_map_info.json')]}
     data = ad.AnnData(matrix, obs=obs, var=var, uns=uns)
     output_h5ad.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(prefix='.' + output_h5ad.name + '.', suffix='.h5ad', dir=output_h5ad.parent)
+    fd, name = tempfile.mkstemp(prefix='.' + output_h5ad.name + '.', suffix='.h5ad', dir=project_temporary_parent(output_h5ad))
     os.close(fd)
     temporary = Path(name)
     try:
@@ -405,7 +407,7 @@ def prepare_rna_counts(input_h5ad: Path, quant_json: Path, reference: Path,
         'background_competitor_count_sum': float(sink.sum()),
         'background_competitor_cells_positive': int((sink > 0).sum())}
     output_h5ad.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(prefix='.'+output_h5ad.name+'.', suffix='.h5ad', dir=output_h5ad.parent)
+    fd, name = tempfile.mkstemp(prefix='.'+output_h5ad.name+'.', suffix='.h5ad', dir=project_temporary_parent(output_h5ad))
     os.close(fd); temporary = Path(name)
     try:
         biological.write_h5ad(temporary)
@@ -573,14 +575,8 @@ def finalize_rna_h5ad(
 
     destination = Path(output_h5ad)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = destination.with_name(destination.name + ".tmp.h5ad")
-    try:
+    with atomic_output(destination) as temp_path:
         adata.write_h5ad(temp_path)
-        os.replace(temp_path, destination)
-    finally:
-        if temp_path.exists():
-            temp_path.unlink()
-    return destination
 
 
 def finalize_rna_h5ad_main(argv: Sequence[str] | None = None) -> int:

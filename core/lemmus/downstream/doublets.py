@@ -22,6 +22,7 @@ from .integration import (
     load_dna_qc,
     validate_droplet_integration_links,
 )
+from ..io import project_temporary_parent
 from .io import (
     write_lock,
     atomic_write_csv,
@@ -550,7 +551,7 @@ def export_droplet_single_cpg(result_dir, dna_project_root, *, dna_doublet_resul
     if target == source:
         raise DownstreamQCError('SingleCpG 输出不得覆盖输入矩阵')
     with write_lock(out), write_lock(destination):
-        fd, temporary = tempfile.mkstemp(prefix='.SingleCpG-', suffix='.h5ad', dir=destination)
+        fd, temporary = tempfile.mkstemp(prefix='.SingleCpG-', suffix='.h5ad', dir=project_temporary_parent(target))
         os.close(fd)
         tmp = Path(temporary)
         try:

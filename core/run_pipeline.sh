@@ -71,6 +71,7 @@ fi
 
 PROJECT="$(rna_darlin_find_project)" || { echo "ERROR: cannot find <project>/00_config/config.yaml from current directory upward" >&2; exit 2; }
 CONFIG="$PROJECT/00_config/config.yaml"
+export RNA_DARLIN_PROJECT_DIR="$PROJECT"
 
 if [[ "$MODE" == refresh ]]; then
   refresh_python="$RNA_DARLIN_CONTROL_ENV/bin/python"
@@ -97,6 +98,10 @@ rna_darlin_native_quantifier check || { echo "ERROR: RNA quantifier requires log
 
 export RNA_DARLIN_CONFIG="$CONFIG" RNA_DARLIN_PROJECT_DIR="$PROJECT" RNA_DARLIN_RULE_ENV="$RULE_ENV"
 export PATH="$RULE_ENV/bin:$RULE_ENV/lib/jvm/bin:$CONTROL_ENV/bin:$PATH" PYTHONNOUSERSITE=1
+[[ ! -L "$PROJECT/05_tmp" ]] || { echo "ERROR: 05_tmp must be a real directory" >&2; exit 2; }
+export TMPDIR="$PROJECT/05_tmp" TMP="$PROJECT/05_tmp" TEMP="$PROJECT/05_tmp" TEMPDIR="$PROJECT/05_tmp"
+TMP_LITERAL="$("$RULE_ENV/bin/python" -c 'import sys; print(repr(sys.argv[1]))' "$TMPDIR")"
+LOCAL_ARGS+=(--default-resources "tmpdir=$TMP_LITERAL")
 export XDG_CACHE_HOME="$PROJECT/05_tmp/xdg_cache" MPLCONFIGDIR="$PROJECT/05_tmp/matplotlib"
 unset PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE VIRTUAL_ENV
 mkdir -p "$XDG_CACHE_HOME" "$MPLCONFIGDIR" "$PROJECT/04_logs/controller" "$PROJECT/04_logs/slurm"
@@ -129,7 +134,7 @@ case "$(uname -s)" in
     "$SNAKEMAKE" --snakefile "$RNA_DARLIN_PIPELINE_ROOT/core/Snakefile" \
       --executor slurm --scheduler greedy --jobs "$JOBS" --local-cores "$LOCAL_CORES" \
       --max-jobs-per-timespan 30/1s --max-status-checks-per-second 5 \
-      --default-resources "slurm_partition=$PARTITION" \
+      --default-resources "tmpdir=$TMP_LITERAL" "slurm_partition=$PARTITION" \
       --slurm-logdir "$PROJECT/04_logs/slurm" --slurm-delete-logfiles-older-than 0 --slurm-qos "$QOS" \
       "${COMMON[@]}" 2>&1 | tee "$LOG"
     ;;

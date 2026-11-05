@@ -1,5 +1,6 @@
 """Lemmus：持久科学指标与 MultiQC 展示。"""
 from __future__ import annotations
+from .io import atomic_output
 
 import argparse
 import csv
@@ -232,17 +233,16 @@ def build_multiqc_custom_content(
             outputs.append(alignment_mqc)
             alignment_output = Path(alignment_output)
             alignment_output.parent.mkdir(parents=True, exist_ok=True)
-            alignment_tmp = alignment_output.with_name(alignment_output.name + ".tmp")
-            with alignment_tmp.open("w", encoding="utf-8", newline="") as handle:
-                writer = csv.DictWriter(
-                    handle,
-                    fieldnames=["sample_id", "rna_cells", "darlin_cells", "matched_cells", "rna_only_cells", "darlin_only_cells", "rna_only_examples", "darlin_only_examples"],
-                    delimiter="\t",
-                    lineterminator="\n",
-                )
-                writer.writeheader()
-                writer.writerows(tsv_rows)
-            alignment_tmp.replace(alignment_output)
+            with atomic_output(alignment_output) as alignment_tmp:
+                with alignment_tmp.open("w", encoding="utf-8", newline="") as handle:
+                    writer = csv.DictWriter(
+                        handle,
+                        fieldnames=["sample_id", "rna_cells", "darlin_cells", "matched_cells", "rna_only_cells", "darlin_only_cells", "rna_only_examples", "darlin_only_examples"],
+                        delimiter="\t",
+                        lineterminator="\n",
+                    )
+                    writer.writeheader()
+                    writer.writerows(tsv_rows)
 
     darlin_barcode_metrics = list(darlin_barcode_metrics or [])
     if darlin_barcode_metrics:

@@ -1,6 +1,7 @@
 """DD-MET5 RNA：有界分块并行、原生接头匹配和按输入顺序提交。"""
 
 from __future__ import annotations
+from .io import project_temporary_parent
 import argparse, io, os, time, json, tempfile, multiprocessing
 from pathlib import Path
 from collections import deque
@@ -112,6 +113,7 @@ def preprocess_droplet_rna(
     destinations = (output_r1, output_r2, qc)
     for path in destinations:
         path.parent.mkdir(parents=True, exist_ok=True)
+        project_temporary_parent(path)
     started = time.perf_counter()
     metrics = dict.fromkeys(_KEYS, 0)
     hits = [0] * len(adapters)
@@ -122,7 +124,7 @@ def preprocess_droplet_rna(
     chunks = 0
     input_time = output_time = 0.0
     with tempfile.TemporaryDirectory(
-        prefix=".droplet-trim.", dir=output_r1.parent
+        prefix=".droplet-trim.", dir=project_temporary_parent(output_r1)
     ) as tmp:
         a, b = Path(tmp) / "R1.fq.gz", Path(tmp) / "R2.fq.gz"
         with (

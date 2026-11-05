@@ -279,7 +279,8 @@ DROPLET_DIR = WORK_ROOT / "droplet"
 RNA_DARLIN_FASTQ_DIR = WORK_DIR / "rna_darlin_fastq"
 RNA_DARLIN_PREFILTER_DIR = LOG_DIR / "darlin_rna_prefilter"
 
-shell.prefix("set -euo pipefail; ")
+PROJECT_TMP_DIR = DATA_DIR / "05_tmp"
+shell.prefix("set -euo pipefail; test ! -L {tmp}; mkdir -p {tmp}; export RNA_DARLIN_PROJECT_DIR={project} TMPDIR={tmp} TMP={tmp} TEMP={tmp} TEMPDIR={tmp}; ".format(project=shlex.quote(str(DATA_DIR)), tmp=shlex.quote(str(PROJECT_TMP_DIR))).replace("{", "{{").replace("}", "}}"))
 
 
 def fastq_r1(wildcards):
@@ -335,7 +336,7 @@ DARLIN_MERGED_EVIDENCE_OUTPUTS = (
 
 RNA_QC_DIR = RESULTS_ROOT / "QC_Results"
 RNA_FASTQC_DIR = LOGS_ROOT / "fastqc" / "raw_reads"
-RNA_FASTQC_LINK_DIR = WORK_ROOT / "fastqc_raw_reads"
+RNA_FASTQC_LINK_DIR = PROJECT_TMP_DIR / "fastqc_raw_reads"
 RNA_CELL_QC_SUMMARY_DIR = LOGS_ROOT / "cell_qc"
 READ_FATE_WORK_DIR = WORK_ROOT / "read_fate"
 READ_FATE_TSV = RNA_QC_DIR / "read_fate.tsv"
@@ -1209,7 +1210,7 @@ rule rna_fastqc_raw_reads:
         mkdir -p {params.outdir:q} "$(dirname {params.link:q})" "$(dirname {log:q})"
         rm -f {params.link:q} {output.zip:q} {params.html:q}
         ln -s {input.fastq:q} {params.link:q}
-        fastqc --quiet --threads {threads} --outdir {params.outdir:q} {params.link:q} > {log:q} 2>&1
+        fastqc --quiet --dir {PROJECT_TMP_DIR:q} --threads {threads} --outdir {params.outdir:q} {params.link:q} > {log:q} 2>&1
         # ZIP 是稳定的原生 QC 输入；独立 HTML 不作为正式结果保留。
         rm -f {params.link:q} {params.html:q}
         """

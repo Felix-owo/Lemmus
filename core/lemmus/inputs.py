@@ -1,5 +1,6 @@
 """Lemmus：输入发现、manifest 与 barcode 身份。"""
 from __future__ import annotations
+from .io import project_temporary_parent, atomic_output
 
 import argparse
 import csv
@@ -141,7 +142,7 @@ def load_barcode_config(path: str | Path, *, require_rna: bool=True) -> BarcodeC
 def write_rna_whitelist(config: BarcodeConfig, output_path: str | Path) -> Path:
     output = Path(output_path).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=f'.{output.name}.', dir=output.parent, text=True)
+    fd, temporary = tempfile.mkstemp(prefix=f'.{output.name}.', dir=project_temporary_parent(output), text=True)
     try:
         with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as handle:
             for barcode in config.rna_barcodes:
@@ -311,12 +312,11 @@ def refresh(project: Path, *, dry_run: bool=False) -> list[dict[str, str]]:
         writer.writeheader()
         writer.writerows(rows)
     else:
-        temporary = manifest.with_name(f'.{manifest.name}.tmp')
-        with temporary.open('w', encoding='utf-8', newline='') as handle:
-            writer = csv.DictWriter(handle, fieldnames=MANIFEST_FIELDS, delimiter='\t', lineterminator='\n')
-            writer.writeheader()
-            writer.writerows(rows)
-        temporary.replace(manifest)
+        with atomic_output(manifest) as temporary:
+            with temporary.open('w', encoding='utf-8', newline='') as handle:
+                writer = csv.DictWriter(handle, fieldnames=MANIFEST_FIELDS, delimiter='\t', lineterminator='\n')
+                writer.writeheader()
+                writer.writerows(rows)
     return rows
 
 
@@ -525,9 +525,8 @@ def write_rna_whitelist_main(argv: Sequence[str] | None = None) -> int:
     if args.design_whitelist is not None:
         values = load_droplet_whitelist(args.design_whitelist)
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(mode='w', dir=args.output.parent, delete=False) as handle:
-            handle.write('\n'.join(sorted(values))+'\n')
-        os.replace(handle.name, args.output)
+        with atomic_output(args.output) as temporary:
+            temporary.write_text('\n'.join(sorted(values))+'\n')
         return 0
 
     config = load_barcode_config(args.barcode_map, require_rna=True)

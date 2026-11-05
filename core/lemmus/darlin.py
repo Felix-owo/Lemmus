@@ -1,5 +1,6 @@
 """Lemmus：DARLIN 流式提取、共识与 clone 交付。"""
 from __future__ import annotations
+from .io import project_temporary_parent, atomic_output
 
 import argparse
 import csv
@@ -10,6 +11,7 @@ import os
 import re
 import sys
 import time
+import tempfile
 from contextlib import ExitStack
 from itertools import islice
 from pathlib import Path
@@ -1557,43 +1559,42 @@ def _write_read_fate_sidecar(output, template, raw_reads, total_reads, candidate
 
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(f'.{output.name}.tmp')
-    block_size = 1_000_000
-    written = 0
-    with gzip.open(temporary, 'wt', encoding='utf-8', newline='', compresslevel=1) as handle:
-        writer = csv.writer(handle, delimiter='\t', lineterminator='\n')
-        writer.writerow(READ_FATE_SIDECAR_COLUMNS)
-        inventory_handle = gzip.open(raw_reads, 'rt', encoding='utf-8') if isinstance(raw_reads, (str, os.PathLike)) else None
-        try:
-            if inventory_handle is not None:
-                line_iterator = iter(inventory_handle)
-            else:
-                line_iterator = iter(raw_reads['read_id'].astype(str))
-            while True:
-                block = list(islice(line_iterator, block_size))
-                if not block:
-                    break
-                read_ids = [line.rstrip('\n') for line in block]
-                offset = written
-                written += len(read_ids)
-                if written > total_reads:
-                    raise ValueError('DARLIN read-ID inventory is longer than the parsed read count')
-                end = offset + len(read_ids)
-                writer.writerows(zip(
-                    read_ids,
-                    (template,) * len(read_ids),
-                    fate_all[offset:end],
-                    cell_all[offset:end],
-                    clone_all[offset:end],
-                    detail_all[offset:end],
-                    strict=True,
-                ))
-        finally:
-            if inventory_handle is not None:
-                inventory_handle.close()
-    if written != total_reads:
-        raise ValueError('DARLIN read-ID inventory does not match the parsed read count')
-    temporary.replace(output)
+    with atomic_output(output) as temporary:
+        block_size = 1_000_000
+        written = 0
+        with gzip.open(temporary, 'wt', encoding='utf-8', newline='', compresslevel=1) as handle:
+            writer = csv.writer(handle, delimiter='\t', lineterminator='\n')
+            writer.writerow(READ_FATE_SIDECAR_COLUMNS)
+            inventory_handle = gzip.open(raw_reads, 'rt', encoding='utf-8') if isinstance(raw_reads, (str, os.PathLike)) else None
+            try:
+                if inventory_handle is not None:
+                    line_iterator = iter(inventory_handle)
+                else:
+                    line_iterator = iter(raw_reads['read_id'].astype(str))
+                while True:
+                    block = list(islice(line_iterator, block_size))
+                    if not block:
+                        break
+                    read_ids = [line.rstrip('\n') for line in block]
+                    offset = written
+                    written += len(read_ids)
+                    if written > total_reads:
+                        raise ValueError('DARLIN read-ID inventory is longer than the parsed read count')
+                    end = offset + len(read_ids)
+                    writer.writerows(zip(
+                        read_ids,
+                        (template,) * len(read_ids),
+                        fate_all[offset:end],
+                        cell_all[offset:end],
+                        clone_all[offset:end],
+                        detail_all[offset:end],
+                        strict=True,
+                    ))
+            finally:
+                if inventory_handle is not None:
+                    inventory_handle.close()
+        if written != total_reads:
+            raise ValueError('DARLIN read-ID inventory does not match the parsed read count')
 
 
 def _link_fastq(source, target):
@@ -1877,170 +1878,167 @@ def extract_barcodes_multi(args):
     """
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
-    work_dir = Path(args.work_dir)
-    work_dir.mkdir(parents=True, exist_ok=True)
-    fastq_dir = _prepare_fastq_dir(args.fastq_r1, args.fastq_r2, args.sample, work_dir)
-    ref_barcodes = _load_cell_barcode_whitelist(args.cell_barcode_whitelist, args.cell_barcode_length)
-    barcode_index = _build_unique_hamming1_barcode_index(ref_barcodes)
-    templates = list(dict.fromkeys(args.template))
-    if not templates:
-        raise ValueError('At least one DARLIN template is required')
+    parent = project_temporary_parent(Path(args.work_dir) / 'stream')
+    parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.darlin-stream.', dir=parent) as temporary:
+        work_dir = Path(temporary)
+        fastq_dir = _prepare_fastq_dir(args.fastq_r1, args.fastq_r2, args.sample, work_dir)
+        ref_barcodes = _load_cell_barcode_whitelist(args.cell_barcode_whitelist, args.cell_barcode_length)
+        barcode_index = _build_unique_hamming1_barcode_index(ref_barcodes)
+        templates = list(dict.fromkeys(args.template))
+        if not templates:
+            raise ValueError('At least one DARLIN template is required')
 
-    inventory_path = work_dir / 'read_ids.txt.gz'
-    candidate_streams = {}
-    candidate_writers = {}
-    candidate_row_counts = {template: 0 for template in templates}
-    filtered_chunks = {template: [] for template in templates}
-    use_short_3prime_by_template = {}
-    correction_counts = {'exact': 0, 'corrected_hamming1': 0, 'ambiguous': 0, 'unmatched': 0}
-    total_reads = 0
-    chunk_count = 0
-    started = time.time()
-    candidate_columns = ['read_ordinal', 'cell_bc', 'cell_id', 'umi', 'clone_id', '3prime_detected', '3prime_match_type', '3prime_mismatch_count']
+        inventory_path = work_dir / 'read_ids.txt.gz'
+        candidate_streams = {}
+        candidate_writers = {}
+        candidate_row_counts = {template: 0 for template in templates}
+        filtered_chunks = {template: [] for template in templates}
+        use_short_3prime_by_template = {}
+        correction_counts = {'exact': 0, 'corrected_hamming1': 0, 'ambiguous': 0, 'unmatched': 0}
+        total_reads = 0
+        chunk_count = 0
+        started = time.time()
+        candidate_columns = ['read_ordinal', 'cell_bc', 'cell_id', 'umi', 'clone_id', '3prime_detected', '3prime_match_type', '3prime_mismatch_count']
 
-    with gzip.open(inventory_path, 'wt', encoding='utf-8', newline='', compresslevel=1) as inventory_handle, \
-         ExitStack() as candidate_stack:
-        for template in templates:
-            candidate_path = work_dir / f'candidates_{template}.tsv.gz'
-            handle = candidate_stack.enter_context(gzip.open(candidate_path, 'wt', encoding='utf-8', newline='', compresslevel=1))
-            candidate_streams[template] = candidate_path
-            candidate_writers[template] = csv.writer(handle, delimiter='\t', lineterminator='\n')
-            candidate_writers[template].writerow(candidate_columns)
-
-        for raw_chunk in iter_CARLIN_raw_read_chunks(
-            str(fastq_dir), args.sample,
-            cell_barcode_length=args.cell_barcode_length,
-            umi_length=args.umi_length,
-            chunk_size=args.chunk_size,
-        ):
-            chunk_count += 1
-            total_reads += len(raw_chunk)
-            inventory_handle.write('\n'.join(raw_chunk['read_id'].astype(str).tolist()))
-            inventory_handle.write('\n')
-            corrected = correct_darlin_cell_barcodes(raw_chunk, barcode_index=barcode_index)
-            counts = corrected['cell_bc_correction_status'].value_counts()
-            for status in correction_counts:
-                correction_counts[status] += int(counts.get(status, 0))
-            valid_chunk = corrected[corrected['cell_bc'].ne('')].drop(columns=['cell_bc_original', 'cell_bc_correction_status'])
-            if chunk_count % 20 == 0:
-                rate = total_reads / max(time.time() - started, 1e-9)
-                print(f'[extract-barcodes-multi] sample={args.sample} chunks={chunk_count} reads={total_reads} rate={rate:.0f} reads/s rss={_peak_rss_mb():.0f}MB', flush=True)
-            if valid_chunk.empty:
-                continue
-            chunk_length = int(valid_chunk['clone_id'].iloc[:100].str.len().mean())
+        with gzip.open(inventory_path, 'wt', encoding='utf-8', newline='', compresslevel=1) as inventory_handle, \
+             ExitStack() as candidate_stack:
             for template in templates:
-                inferred_short = chunk_length < 300
-                pinned = use_short_3prime_by_template.get(template)
-                if pinned is None:
-                    use_short_3prime_by_template[template] = inferred_short
-                elif pinned != inferred_short:
-                    raise ValueError(
-                        f'DARLIN primer-variant decision changed mid-stream for template {template!r} '
-                        f'in sample {args.sample!r}: first chunks implied '
-                        f'{"short" if pinned else "long"} 3-prime primer, a later chunk implies '
-                        f'{"short" if inferred_short else "long"}; refusing to switch primers on a mixed-length stream'
-                    )
+                candidate_path = work_dir / f'candidates_{template}.tsv.gz'
+                handle = candidate_stack.enter_context(gzip.open(candidate_path, 'wt', encoding='utf-8', newline='', compresslevel=1))
+                candidate_streams[template] = candidate_path
+                candidate_writers[template] = csv.writer(handle, delimiter='\t', lineterminator='\n')
+                candidate_writers[template].writerow(candidate_columns)
 
-                def collect(message):
-                    return None
-
-                filtered, candidates = CARLIN_preprocessing(
-                    valid_chunk,
-                    template=template,
-                    ref_cell_barcodes=None,
-                    seq_3prime_upper_N=args.seq_3prime_upper_n,
-                    seq_3prime_max_mismatches=args.seq_3prime_max_mismatches,
-                    seq_5prime_max_edits=args.seq_5prime_max_edits,
-                    seq_5prime_upper_N=None,
-                    return_read_level=True,
-                    use_short_3prime=use_short_3prime_by_template[template],
-                    progress=collect,
-                )
-                if not filtered.empty:
-                    filtered_chunks[template].append(filtered)
-                if not candidates.empty:
-                    candidate_writers[template].writerows(
-                        zip(
-                            candidates['read_ordinal'].to_numpy(),
-                            candidates['cell_bc'].astype(str).to_numpy(),
-                            candidates['cell_id'].astype(str).to_numpy(),
-                            candidates['umi'].astype(str).to_numpy(),
-                            candidates['clone_id'].astype(str).to_numpy(),
-                            candidates['3prime_detected'].astype(bool).astype(int).to_numpy(),
-                            candidates['3prime_match_type'].astype(str).to_numpy(),
-                            pd.to_numeric(candidates['3prime_mismatch_count'], errors='coerce').fillna(-1).astype(int).to_numpy(),
-                            strict=True,
+            for raw_chunk in iter_CARLIN_raw_read_chunks(
+                str(fastq_dir), args.sample,
+                cell_barcode_length=args.cell_barcode_length,
+                umi_length=args.umi_length,
+                chunk_size=args.chunk_size,
+            ):
+                chunk_count += 1
+                total_reads += len(raw_chunk)
+                inventory_handle.write('\n'.join(raw_chunk['read_id'].astype(str).tolist()))
+                inventory_handle.write('\n')
+                corrected = correct_darlin_cell_barcodes(raw_chunk, barcode_index=barcode_index)
+                counts = corrected['cell_bc_correction_status'].value_counts()
+                for status in correction_counts:
+                    correction_counts[status] += int(counts.get(status, 0))
+                valid_chunk = corrected[corrected['cell_bc'].ne('')].drop(columns=['cell_bc_original', 'cell_bc_correction_status'])
+                if chunk_count % 20 == 0:
+                    rate = total_reads / max(time.time() - started, 1e-9)
+                    print(f'[extract-barcodes-multi] sample={args.sample} chunks={chunk_count} reads={total_reads} rate={rate:.0f} reads/s rss={_peak_rss_mb():.0f}MB', flush=True)
+                if valid_chunk.empty:
+                    continue
+                chunk_length = int(valid_chunk['clone_id'].iloc[:100].str.len().mean())
+                for template in templates:
+                    inferred_short = chunk_length < 300
+                    pinned = use_short_3prime_by_template.get(template)
+                    if pinned is None:
+                        use_short_3prime_by_template[template] = inferred_short
+                    elif pinned != inferred_short:
+                        raise ValueError(
+                            f'DARLIN primer-variant decision changed mid-stream for template {template!r} '
+                            f'in sample {args.sample!r}: first chunks implied '
+                            f'{"short" if pinned else "long"} 3-prime primer, a later chunk implies '
+                            f'{"short" if inferred_short else "long"}; refusing to switch primers on a mixed-length stream'
                         )
+
+                    def collect(message):
+                        return None
+
+                    filtered, candidates = CARLIN_preprocessing(
+                        valid_chunk,
+                        template=template,
+                        ref_cell_barcodes=None,
+                        seq_3prime_upper_N=args.seq_3prime_upper_n,
+                        seq_3prime_max_mismatches=args.seq_3prime_max_mismatches,
+                        seq_5prime_max_edits=args.seq_5prime_max_edits,
+                        seq_5prime_upper_N=None,
+                        return_read_level=True,
+                        use_short_3prime=use_short_3prime_by_template[template],
+                        progress=collect,
                     )
-                    candidate_row_counts[template] += len(candidates)
+                    if not filtered.empty:
+                        filtered_chunks[template].append(filtered)
+                    if not candidates.empty:
+                        candidate_writers[template].writerows(
+                            zip(
+                                candidates['read_ordinal'].to_numpy(),
+                                candidates['cell_bc'].astype(str).to_numpy(),
+                                candidates['cell_id'].astype(str).to_numpy(),
+                                candidates['umi'].astype(str).to_numpy(),
+                                candidates['clone_id'].astype(str).to_numpy(),
+                                candidates['3prime_detected'].astype(bool).astype(int).to_numpy(),
+                                candidates['3prime_match_type'].astype(str).to_numpy(),
+                                pd.to_numeric(candidates['3prime_mismatch_count'], errors='coerce').fillna(-1).astype(int).to_numpy(),
+                                strict=True,
+                            )
+                        )
+                        candidate_row_counts[template] += len(candidates)
 
-    candidate_ordinal_arrays = {}
-    dual_anchor_ordinal_arrays = {}
-    for template in templates:
-        template_started = time.time()
-        output = output_root / template / args.sample / 'DARLIN_Barcodes.csv'
-        sidecar = output_root / template / args.sample / 'read_fate.tsv.gz'
-        output.parent.mkdir(parents=True, exist_ok=True)
-        filtered = _combine_streamed_darlin_candidates(filtered_chunks[template])
-        # UMI-level allele consensus runs before the read cutoff so sequencing-error
-        # variants of one molecule jointly support that molecule (documented
-        # production architecture, docs/contracts/darlin-design.md item 5). Read-level
-        # evidence rows are remapped with the same dictionary so sidecar lineage
-        # validation keeps matching candidate alleles to the denoise lineage.
-        filtered, consensus_remap = _apply_umi_consensus(filtered)
-        candidates = _read_candidate_stream(candidate_streams[template], candidate_columns)
-        if candidates.empty:
-            candidate_ordinal_arrays[template] = np.empty(0, dtype=np.int64)
-            dual_anchor_ordinal_arrays[template] = np.empty(0, dtype=np.int64)
-        else:
-            candidate_ordinal_arrays[template] = candidates['read_ordinal'].to_numpy(dtype=np.int64)
-            detected = candidates['3prime_detected'].astype(bool)
-            dual_anchor_ordinal_arrays[template] = candidates.loc[detected, 'read_ordinal'].to_numpy(dtype=np.int64)
-        candidates = _remap_read_level_alleles(candidates, consensus_remap)
-        final, lineage = _finalize_darlin_template_calls(
-            filtered,
-            template=template,
-            read_cutoff_setting=args.read_cutoff,
-            min_reads_per_allele_group=args.min_reads_per_allele_group,
-            min_cell_read_fraction=args.min_cell_read_fraction,
-        )
-        if final.empty:
-            _write_empty_output(output, pd)
-        else:
-            final.to_csv(output, index=False)
-        _write_read_fate_sidecar(sidecar, template, inventory_path, total_reads, candidates, final, clone_lineage=lineage)
-        print(
-            f'[extract-barcodes-multi] template={template} sample={args.sample} '
-            f'candidate_reads={candidate_row_counts[template]} final_calls={0 if final.empty else len(final)} '
-            f'elapsed={time.time() - template_started:.1f}s',
-            flush=True,
-        )
-        # Release per-template payload before the next template's readback.
-        filtered_chunks[template] = []
-        del candidates, filtered, final, lineage, consensus_remap
+        candidate_ordinal_arrays = {}
+        dual_anchor_ordinal_arrays = {}
+        for template in templates:
+            template_started = time.time()
+            output = output_root / template / args.sample / 'DARLIN_Barcodes.csv'
+            sidecar = output_root / template / args.sample / 'read_fate.tsv.gz'
+            output.parent.mkdir(parents=True, exist_ok=True)
+            filtered = _combine_streamed_darlin_candidates(filtered_chunks[template])
+            # UMI-level allele consensus runs before the read cutoff so sequencing-error
+            # variants of one molecule jointly support that molecule (documented
+            # production architecture, docs/contracts/darlin-design.md item 5). Read-level
+            # evidence rows are remapped with the same dictionary so sidecar lineage
+            # validation keeps matching candidate alleles to the denoise lineage.
+            filtered, consensus_remap = _apply_umi_consensus(filtered)
+            candidates = _read_candidate_stream(candidate_streams[template], candidate_columns)
+            if candidates.empty:
+                candidate_ordinal_arrays[template] = np.empty(0, dtype=np.int64)
+                dual_anchor_ordinal_arrays[template] = np.empty(0, dtype=np.int64)
+            else:
+                candidate_ordinal_arrays[template] = candidates['read_ordinal'].to_numpy(dtype=np.int64)
+                detected = candidates['3prime_detected'].astype(bool)
+                dual_anchor_ordinal_arrays[template] = candidates.loc[detected, 'read_ordinal'].to_numpy(dtype=np.int64)
+            candidates = _remap_read_level_alleles(candidates, consensus_remap)
+            final, lineage = _finalize_darlin_template_calls(
+                filtered,
+                template=template,
+                read_cutoff_setting=args.read_cutoff,
+                min_reads_per_allele_group=args.min_reads_per_allele_group,
+                min_cell_read_fraction=args.min_cell_read_fraction,
+            )
+            if final.empty:
+                _write_empty_output(output, pd)
+            else:
+                final.to_csv(output, index=False)
+            _write_read_fate_sidecar(sidecar, template, inventory_path, total_reads, candidates, final, clone_lineage=lineage)
+            print(
+                f'[extract-barcodes-multi] template={template} sample={args.sample} '
+                f'candidate_reads={candidate_row_counts[template]} final_calls={0 if final.empty else len(final)} '
+                f'elapsed={time.time() - template_started:.1f}s',
+                flush=True,
+            )
+            # Release per-template payload before the next template's readback.
+            filtered_chunks[template] = []
+            del candidates, filtered, final, lineage, consensus_remap
 
-    candidate_ordinal_union = np.unique(np.concatenate(list(candidate_ordinal_arrays.values()))) if candidate_ordinal_arrays else np.empty(0, dtype=np.int64)
-    dual_anchor_ordinal_union = np.unique(np.concatenate(list(dual_anchor_ordinal_arrays.values()))) if dual_anchor_ordinal_arrays else np.empty(0, dtype=np.int64)
-    metrics_path = Path(args.barcode_metrics)
-    metrics_path.parent.mkdir(parents=True, exist_ok=True)
-    accepted = correction_counts['exact'] + correction_counts['corrected_hamming1']
-    with metrics_path.open('w', encoding='utf-8', newline='') as handle:
-        writer = csv.writer(handle, delimiter='\t', lineterminator='\n')
-        writer.writerow(['sample', 'source_type', 'total_reads', 'exact_barcode_reads', 'corrected_hamming1_reads', 'ambiguous_barcode_reads', 'unmatched_barcode_reads', 'accepted_barcode_reads', 'accepted_fraction', 'correction_fraction_of_accepted', 'darlin_candidate_reads_any_template', 'dual_anchor_reads_any_template'])
-        writer.writerow([
-            args.sample, 'rna_rescue' if str(args.sample).endswith('__RNA') else 'targeted',
-            total_reads, correction_counts['exact'], correction_counts['corrected_hamming1'],
-            correction_counts['ambiguous'], correction_counts['unmatched'], accepted,
-            f'{accepted / total_reads if total_reads else 0.0:.8f}',
-            f'{correction_counts["corrected_hamming1"] / accepted if accepted else 0.0:.8f}',
-            int(candidate_ordinal_union.size), int(dual_anchor_ordinal_union.size),
-        ])
+        candidate_ordinal_union = np.unique(np.concatenate(list(candidate_ordinal_arrays.values()))) if candidate_ordinal_arrays else np.empty(0, dtype=np.int64)
+        dual_anchor_ordinal_union = np.unique(np.concatenate(list(dual_anchor_ordinal_arrays.values()))) if dual_anchor_ordinal_arrays else np.empty(0, dtype=np.int64)
+        metrics_path = Path(args.barcode_metrics)
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        accepted = correction_counts['exact'] + correction_counts['corrected_hamming1']
+        with metrics_path.open('w', encoding='utf-8', newline='') as handle:
+            writer = csv.writer(handle, delimiter='\t', lineterminator='\n')
+            writer.writerow(['sample', 'source_type', 'total_reads', 'exact_barcode_reads', 'corrected_hamming1_reads', 'ambiguous_barcode_reads', 'unmatched_barcode_reads', 'accepted_barcode_reads', 'accepted_fraction', 'correction_fraction_of_accepted', 'darlin_candidate_reads_any_template', 'dual_anchor_reads_any_template'])
+            writer.writerow([
+                args.sample, 'rna_rescue' if str(args.sample).endswith('__RNA') else 'targeted',
+                total_reads, correction_counts['exact'], correction_counts['corrected_hamming1'],
+                correction_counts['ambiguous'], correction_counts['unmatched'], accepted,
+                f'{accepted / total_reads if total_reads else 0.0:.8f}',
+                f'{correction_counts["corrected_hamming1"] / accepted if accepted else 0.0:.8f}',
+                int(candidate_ordinal_union.size), int(dual_anchor_ordinal_union.size),
+            ])
 
-    for path in (inventory_path, *candidate_streams.values()):
-        try:
-            Path(path).unlink()
-        except OSError:
-            pass
 
 
 def _read_candidate_stream(path, columns):
