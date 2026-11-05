@@ -281,7 +281,7 @@ def _validate_rrna_reference_files(reference: Path, species: str) -> dict[str, s
     spec = rrna_reference_spec(species)
     required = ['genome.fa', 'genes/genes.gtf', 'rrna_competitor.fa', 'simpleaf/ref/t2g.tsv',
                 'simpleaf/index/piscem_idx.ctab', 'simpleaf/index/piscem_idx.ectab',
-                'simpleaf/index/piscem_idx.refinfo']
+                'simpleaf/index/piscem_idx.refinfo', 'simpleaf/index/gene_id_to_name.tsv']
     missing = [name for name in required if not (reference/name).is_file() or not (reference/name).stat().st_size]
     if missing:
         raise ValueError('PG+45S RNA reference incomplete: '+', '.join(missing))
@@ -341,6 +341,100 @@ def validate_rna_reference(reference: Path, species: str) -> dict[str, Any]:
     if metadata != expected:
         raise ValueError('RNA reference competitor metadata disagrees with the current PG+45S policy')
     return metadata
+
+
+def export_rna_counts(quant_dir: Path, gene_map: Path, output_h5ad: Path) -> None:
+    """原生 MTX 只做格式导出；直接读取参考注释，避免消费失败的文件副本。"""
+    import anndata as ad
+    import scipy.sparse as sp
+
+    quant = json.loads((quant_dir / 'quant.json').read_text())
+    if quant.get('resolution_strategy') != 'ParsimonyGene' or quant.get('usa_mode') is not False:
+        raise ValueError('RNA export requires two-column parsimony-gene quantification')
+    folder = quant_dir / 'alevin'
+
+    def axis(name):
+        values = (folder / name).read_text().splitlines()
+        if not values or any(not v or '\t' in v for v in values) or len(set(values)) != len(values):
+            raise ValueError('RNA cell/gene identities must be nonempty unique single-column strings')
+        return values
+
+    barcodes = axis('quants_mat_rows.txt')
+    genes = axis('quants_mat_cols.txt')
+    names = pd.read_csv(gene_map, sep='\t', header=None, dtype=str, keep_default_na=False)
+    if (names.shape[1] != 2 or (names == '').any().any() or names[0].duplicated().any()
+            or set(names[0]) != set(genes)):
+        raise ValueError('Reference gene map must match every native gene exactly once')
+    names.columns = ['gene_id', 'gene_symbol']
+    var = names.set_index('gene_id', drop=False).loc[genes].copy()
+    var.index.name = 'index'
+
+    with (folder / 'quants_mat.mtx').open() as handle:
+        header = handle.readline().strip().lower().split()
+        if (len(header) != 5 or header[:3] != ['%%matrixmarket', 'matrix', 'coordinate']
+                or header[3] not in {'integer', 'real'} or header[4] != 'general'):
+            raise ValueError('Expected general coordinate integer/real native Matrix Market counts')
+        line = handle.readline()
+        while line.startswith('%'):
+            line = handle.readline()
+        rows, cols, nnz = map(int, line.split())
+        if ((rows, cols) != (len(barcodes), len(genes)) or nnz < 0
+                or quant.get('num_genes') != cols or quant.get('num_quantified_cells') != rows):
+            raise ValueError('Native quantification metadata, axes and matrix shape disagree')
+        dtype = [('row', np.int64), ('col', np.int64),
+                 ('value', np.int64 if header[3] == 'integer' else np.float64)]
+        entries = np.loadtxt(handle, dtype=dtype, ndmin=1) if nnz else np.empty(0, dtype=dtype)
+        if nnz == 0 and any(line.strip() and not line.startswith('%') for line in handle):
+            raise ValueError('Native matrix has undeclared entries')
+    if (len(entries) != nnz or (entries['row'] < 1).any() or (entries['row'] > rows).any()
+            or (entries['col'] < 1).any() or (entries['col'] > cols).any()
+            or not np.isfinite(entries['value']).all() or (entries['value'] < 0).any()):
+        raise ValueError('Invalid native matrix coordinates, entry count or molecule values')
+    matrix = sp.coo_matrix((entries['value'], (entries['row'] - 1, entries['col'] - 1)),
+                           shape=(rows, cols)).tocsr()
+    if matrix.nnz != nnz:
+        raise ValueError('Duplicate native matrix coordinates must not be silently summed')
+
+    rename = dict(CorrectedReads='corrected_reads', MappedReads='mapped_reads',
+                  DeduplicatedReads='deduplicated_reads', MappingRate='mapping_rate',
+                  DedupRate='dedup_rate', MeanByMax='mean_by_max',
+                  NumGenesExpressed='num_genes_expressed', NumGenesOverMean='num_genes_over_mean')
+    feature_types = {key: (np.int64 if key in {'CorrectedReads', 'MappedReads',
+                     'NumGenesExpressed', 'NumGenesOverMean'} else np.float64) for key in rename}
+    features = pd.read_csv(quant_dir / 'featureDump.txt', sep='\t',
+                           dtype=str, keep_default_na=False)
+    if list(features.columns) != ['CB', *rename] or features['CB'].tolist() != barcodes:
+        raise ValueError('Native featureDump barcode identity/order or columns disagree')
+    obs = features.drop(columns='CB').rename(columns=rename)
+    for column in obs:
+        # 原生空背景条码的比率可为 NaN；保留未定义值，不补零、不改分子计数。
+        source_name = next(key for key, value in rename.items() if value == column)
+        obs[column] = np.asarray(obs[column], dtype=feature_types[source_name])
+    obs.index = pd.Index(barcodes, name='index')
+    obs.insert(0, 'barcodes', barcodes)
+    uns = {key: json.dumps(json.loads((quant_dir / file).read_text()), separators=(',', ':'))
+           for key, file in [('gpl_info', 'generate_permit_list.json'), ('collate_info', 'collate.json'),
+                             ('quant_info', 'quant.json'), ('simpleaf_map_info', 'simpleaf_map_info.json')]}
+    data = ad.AnnData(matrix, obs=obs, var=var, uns=uns)
+    output_h5ad.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix='.' + output_h5ad.name + '.', suffix='.h5ad', dir=output_h5ad.parent)
+    os.close(fd)
+    temporary = Path(name)
+    try:
+        data.write_h5ad(temporary)
+        os.replace(temporary, output_h5ad)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def export_rna_counts_main(argv=None):
+    """内部格式导出入口；不执行 barcode correction 或分子重分配。"""
+    parser = argparse.ArgumentParser()
+    for key in ('quant-dir', 'gene-map', 'output'):
+        parser.add_argument('--' + key, type=Path, required=True)
+    args = parser.parse_args(argv)
+    export_rna_counts(args.quant_dir, args.gene_map, args.output)
+    return 0
 
 
 def prepare_rna_counts(input_h5ad: Path, quant_json: Path, reference: Path,

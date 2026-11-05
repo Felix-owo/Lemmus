@@ -26,31 +26,25 @@ source "$RNA_DARLIN_PIPELINE_ROOT/core/doctor.sh"
 
 usage() {
   cat <<'TXT'
-用法: run_pipeline.sh [--init-project --protocol NAME | --refresh-manifest | --dry-run|-n | --help]
+用法: run_pipeline.sh [--init-project | --refresh-manifest | --dry-run|-n | --help]
 
 无参数              正式运行当前项目
 --init-project       在当前目录初始化项目后立即退出
---protocol NAME      初始化时必填：cabernet 或 droplet；同一 config 展示两个模块，选择其中一个生效
 --refresh-manifest   刷新 sample manifest 后立即退出
 --dry-run, -n        只解析完整 DAG，不提交 rule job
 
 平台：macOS 使用 local；Linux/HPC login 或已有 compute allocation 都由当前 shell
 作为 Snakemake controller，并使用 Slurm executor 提交 rule jobs。
 
-Cabernet 初始化: run_pipeline.sh --init-project --protocol cabernet
-DD-MET5 初始化:  run_pipeline.sh --init-project --protocol droplet
+初始化: run_pipeline.sh --init-project
+编辑 config.yaml 的 pipeline_mode 选择 cabernet（默认）或 droplet。
 TXT
 }
 
 MODE=run
-INIT_PROTOCOL=""
 while (($#)); do
   case "$1" in
     --init-project) [[ "$MODE" == run ]] || { echo "ERROR: maintenance flags cannot be combined" >&2; exit 2; }; MODE=init ;;
-    --protocol)
-      [[ $# -ge 2 && -z "$INIT_PROTOCOL" ]] || { echo "ERROR: --protocol requires one value: cabernet or droplet" >&2; exit 2; }
-      case "$2" in cabernet|droplet) INIT_PROTOCOL="$2" ;; *) echo "ERROR: --protocol must be cabernet or droplet" >&2; exit 2 ;; esac
-      shift ;;
     --refresh-manifest) [[ "$MODE" == run ]] || { echo "ERROR: maintenance flags cannot be combined" >&2; exit 2; }; MODE=refresh ;;
     --dry-run|-n) [[ "$MODE" == run ]] || { echo "ERROR: maintenance flags cannot be combined" >&2; exit 2; }; MODE=dryrun ;;
     -h|--help) usage; exit 0 ;;
@@ -58,15 +52,6 @@ while (($#)); do
   esac
   shift
 done
-
-if [[ "$MODE" == init && -z "$INIT_PROTOCOL" ]]; then
-  echo "ERROR: initialization requires --protocol cabernet or --protocol droplet" >&2
-  exit 2
-fi
-if [[ "$MODE" != init && -n "$INIT_PROTOCOL" ]]; then
-  echo "ERROR: --protocol is only valid with --init-project; existing projects use config.yaml" >&2
-  exit 2
-fi
 
 rna_darlin_find_project() {
   local dir="$PWD" parent
@@ -80,7 +65,7 @@ rna_darlin_find_project() {
 if [[ "$MODE" == init ]]; then
   init_python="$RNA_DARLIN_CONTROL_ENV/bin/python"
   [[ -x "$init_python" ]] || init_python="$(command -v python3 || command -v python)"
-  PYTHONPATH="$RNA_DARLIN_PIPELINE_ROOT/core" "$init_python" -m lemmus init-project --project "$PWD" --protocol "$INIT_PROTOCOL"
+  PYTHONPATH="$RNA_DARLIN_PIPELINE_ROOT/core" "$init_python" -m lemmus init-project --project "$PWD"
   exit $?
 fi
 

@@ -75,7 +75,7 @@ if (!requireNamespace("DropletUtils", quietly=TRUE)) {
     install.packages("https://bioconductor.org/packages/3.22/bioc/src/contrib/DropletUtils_1.30.0.tar.gz",
         repos=NULL, type="source")
 }
-stopifnot(packageVersion("DropletUtils") == "1.30.0")
+stopifnot(packageVersion("DropletUtils") == "1.30.0", requireNamespace("DropletUtils", quietly=TRUE))
 cat(capture.output(sessionInfo()), sep="\\n")
 '''
     makevars = args.prefix / 'calling-Makevars'
@@ -83,6 +83,32 @@ cat(capture.output(sessionInfo()), sep="\\n")
     environment = dict(os.environ, R_MAKEVARS_USER=str(makevars), R_LIBS_USER=str(args.prefix / 'lib/R/library'))
     subprocess.run([str(args.conda), 'run', '--no-capture-output', '--prefix', str(args.prefix),
                     str(args.prefix / 'bin/Rscript'), '--vanilla', '-e', code], check=True, env=environment)
+    return 0
+
+
+def check_calling_main(argv=None):
+    """读取 R 包 DESCRIPTION 核对版本；重复检查不启动 R 会话。"""
+    from email.parser import Parser
+    import re
+    parser = argparse.ArgumentParser(prog='lemmus check-calling')
+    parser.add_argument('--prefix', type=Path, required=True)
+    args = parser.parse_args(argv)
+    versions = {}
+    for package in ('base', 'DropletUtils'):
+        path = args.prefix / 'lib/R/library' / package / 'DESCRIPTION'
+        metadata = Parser().parsestr(path.read_text(encoding='utf-8'))
+        if metadata.get_all('Package') != [package] or len(metadata.get_all('Version', [])) != 1:
+            raise ValueError(f'Invalid R package identity: {path}')
+        version = metadata['Version'].strip()
+        if not re.fullmatch(r'[0-9]+(?:[.\-][0-9]+)*', version):
+            raise ValueError(f'Invalid R package version: {path}')
+        parts = tuple(map(int, re.split(r'[.\-]', version)))
+        while parts and parts[-1] == 0:
+            parts = parts[:-1]
+        versions[package] = parts
+    if not ((4, 5) <= versions['base'] < (4, 6) and versions['DropletUtils'] == (1, 30)):
+        raise ValueError('Calling requires R>=4.5,<4.6 and DropletUtils1.30.0')
+    print('Calling package versions: PASS (R4.5 / DropletUtils1.30.0)')
     return 0
 
 
@@ -115,6 +141,99 @@ def census_reference_main(argv=None):
     return 0
 
 
+def _check_environment_packages(prefix: Path, role: str, expected_subdir: str, section: dict) -> None:
+    """只读核对已安装包；不导入目标环境的科学、绘图或 Notebook 模块。"""
+    import json
+    import re
+    from conda.models.match_spec import MatchSpec
+    from conda.models.version import VersionSpec
+    from importlib.metadata import Distribution
+    from packaging.markers import default_environment
+    from packaging.requirements import Requirement
+
+    records: dict[str, dict] = {}
+    native = False
+    for path in (prefix / "conda-meta").glob("*.json"):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        name = record["name"]
+        if name in records:
+            raise ValueError(f"{role}: duplicate installed package {name}")
+        records[name] = record
+        subdir = record.get("subdir")
+        if subdir and subdir != "noarch":
+            if subdir != expected_subdir:
+                raise ValueError(f"{role}: installed package {name} has platform {subdir}")
+            native = True
+    if not native:
+        raise ValueError(f"{role}: no native package records")
+    python_version = records.get("python", {}).get("version", "")
+    python_short = ".".join(python_version.split(".")[:2])
+    site = prefix / "lib" / f"python{python_short}" / "site-packages"
+    marker_environment = default_environment()
+    marker_environment.update(python_version=python_short, python_full_version=python_version)
+    normalize = lambda value: re.sub(r"[-_.]+", "-", value).lower()
+    # Python 包可能由 pip 安装或覆盖；有效版本来自 dist-info，不由残留 Conda 记录代替。
+    python_distributions = {name: name for name in (
+        "anndata", "ipykernel", "jupyterlab", "numba", "numpy", "packaging", "pandas", "polars",
+        "pyyaml", "scikit-learn", "seaborn", "tqdm", "jsonschema", "snakemake",
+        "snakemake-executor-plugin-slurm", "pip", "pysam", "cutadapt", "multiqc", "awscli",
+        "leidenalg", "cykhash", "umi_tools",
+    )}
+    python_distributions.update({"matplotlib-base": "matplotlib", "python-igraph": "igraph"})
+    def distribution_for(name):
+        candidates = list(Distribution.discover(name=name, path=[str(site)]))
+        if len(candidates) != 1:
+            raise ValueError(f"{role}: missing or ambiguous Python metadata for {name}")
+        distribution = candidates[0]
+        if Path(distribution.locate_file("")).resolve() != site.resolve():
+            raise ValueError(f"{role}: Python metadata escaped the managed prefix for {name}")
+        if normalize(distribution.metadata["Name"] or "") != normalize(name):
+            raise ValueError(f"{role}: Python distribution identity mismatch for {name}")
+        return distribution
+    for dependency in section["dependencies"]:
+        if isinstance(dependency, str):
+            spec = MatchSpec(dependency)
+            record = records.get(spec.name)
+            distribution_name = python_distributions.get(spec.name)
+            if distribution_name is not None:
+                distribution = distribution_for(distribution_name)
+                constraint = spec.get_raw_value("version")
+                if constraint and not VersionSpec(constraint).match(distribution.version):
+                    raise ValueError(f"{role}: effective Python package does not satisfy {dependency}")
+                if (spec.get_raw_value("build") is not None or spec.get_raw_value("channel") is not None):
+                    if record is None or not spec.match(record):
+                        raise ValueError(f"{role}: installed artifact does not satisfy {dependency}")
+            elif record is None or not spec.match(record):
+                raise ValueError(f"{role}: installed package does not satisfy {dependency}")
+        else:
+            for item in dependency["pip"]:
+                requirement = Requirement(item)
+                if requirement.marker and not requirement.marker.evaluate(marker_environment):
+                    continue
+                distribution = distribution_for(requirement.name)
+                if distribution.version not in requirement.specifier:
+                    raise ValueError(f"{role}: installed pip package does not satisfy {item}")
+
+
+def check_environments_main(argv=None):
+    """Doctor只读读取安装记录；完整模块导入留在候选环境创建阶段。"""
+    parser = argparse.ArgumentParser(prog='lemmus check-environments')
+    parser.add_argument('--role', action='append', choices=('control', 'rules', 'atlas'), required=True)
+    args = parser.parse_args(argv)
+    import platform
+    machine = platform.machine().lower()
+    os_name = 'osx' if sys.platform == 'darwin' else 'linux' if sys.platform.startswith('linux') else None
+    if os_name is None:
+        raise ValueError(f'unsupported managed environment platform: {sys.platform}')
+    expected = os_name + '-' + ('64' if machine == 'x86_64' else machine)
+    sections = yaml.safe_load((PIPELINE_ROOT / 'core/envs.yaml').read_text())
+    for role in args.role:
+        prefix = (PIPELINE_ROOT / 'conda/current' / role).resolve(strict=True)
+        _check_environment_packages(prefix, role, expected, sections[role])
+    print('Managed environment package versions/platform: PASS (' + ', '.join(args.role) + ')')
+    return 0
+
+
 def env_spec_main(argv=None):
     """从单一 envs.yaml 提取指定角色为 Conda 可消费 spec。"""
     parser = argparse.ArgumentParser(prog="lemmus env-spec")
@@ -137,7 +256,7 @@ def parser_fixture_main(argv=None):
     parser.add_argument("--project", type=Path, required=True)
     args = parser.parse_args(argv)
     project = args.project.resolve()
-    init_project_main(["--project", str(project), "--protocol", "cabernet"])
+    init_project_main(["--project", str(project)])
     # 只准备parser输入，不伪造可用reference或声称比对真值。
     import gzip
     raw_rna = project / "01_raw/RNA"

@@ -12,7 +12,7 @@ RNA_DARLIN_ATLAS_MODEL_SIZE=931490141
 RNA_DARLIN_CONTROL_EXECUTABLES=(bin/python bin/snakemake)
 RNA_DARLIN_RULE_EXECUTABLES=(bin/python bin/simpleaf bin/piscem bin/alevin-fry bin/umi_tools bin/fastqc bin/multiqc lib/jvm/bin/java)
 RNA_DARLIN_ATLAS_EXECUTABLES=(bin/python bin/jupyter bin/aws)
-RNA_DARLIN_CALLING_EXECUTABLES=(bin/Rscript bin/cutadapt)
+RNA_DARLIN_CALLING_EXECUTABLES=(bin/python bin/Rscript bin/cutadapt)
 export RNA_DARLIN_PIPELINE_ROOT PYTHONPATH="$RNA_DARLIN_PIPELINE_ROOT/core"
 
 usage() {
@@ -65,14 +65,29 @@ rna_darlin_check_env() {
   return "$missing"
 }
 
-rna_darlin_check_atlas_env() {
+rna_darlin_check_atlas_tools() {
   local exe missing=0
   for exe in "${RNA_DARLIN_ATLAS_EXECUTABLES[@]}"; do [[ -x "$RNA_DARLIN_ATLAS_ENV/$exe" ]] || { echo "缺失: $RNA_DARLIN_ATLAS_ENV/$exe" >&2; missing=1; }; done
-  (( missing == 0 )) && "$RNA_DARLIN_ATLAS_ENV/bin/python" -c 'import anndata, cellxgene_census, igraph, leidenalg, scanpy, scvi, sklearn, skimage, hdf5plugin, snapatac2; from ALLCools.clustering.doublets import MethylScrublet' >/dev/null 2>&1 || missing=1
   return "$missing"
 }
 
-rna_darlin_check_all_env() { rna_darlin_check_env && rna_darlin_check_atlas_env; }
+rna_darlin_check_environment_packages() {
+  local role
+  local -a arguments=()
+  for role in "$@"; do arguments+=(--role "$role"); done
+  env -u PYTHONHOME PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="$RNA_DARLIN_PIPELINE_ROOT/core" \
+    "$RNA_DARLIN_CONTROL_ENV/bin/python" -m lemmus check-environments "${arguments[@]}"
+}
+
+rna_darlin_check_atlas_env() {
+  rna_darlin_check_atlas_tools && rna_darlin_check_environment_packages atlas
+}
+
+rna_darlin_check_all_env() {
+  rna_darlin_check_env && rna_darlin_check_atlas_tools && \
+    rna_darlin_check_environment_packages control rules atlas
+}
 
 # Droplet 调用环境独立发布；不重建已有 RNA 定量环境。
 rna_darlin_check_calling_env() {
@@ -80,7 +95,9 @@ rna_darlin_check_calling_env() {
   for exe in "${RNA_DARLIN_CALLING_EXECUTABLES[@]}"; do
     [[ -x "$RNA_DARLIN_CALLING_ENV/$exe" ]] || return 1
   done
-  "$RNA_DARLIN_CALLING_ENV/bin/Rscript" --vanilla -e 'stopifnot(getRversion() >= "4.5", getRversion() < "4.6", packageVersion("DropletUtils") == "1.30.0")' >/dev/null 2>&1
+  env -u PYTHONHOME PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="$RNA_DARLIN_PIPELINE_ROOT/core" \
+    "$RNA_DARLIN_CALLING_ENV/bin/python" -m lemmus check-calling --prefix "$RNA_DARLIN_CALLING_ENV"
 }
 
 # HPC 依赖安装在登录节点完成；已有环境可在 allocation 内直接复用。
@@ -388,7 +405,7 @@ rna_darlin_setup_reference() {
   target="$resource_root/${species}_reference/pg45s"
   if [[ -e "$target" ]]; then
     local complete=1
-    for required in genome.fa genes/genes.gtf simpleaf/ref/t2g.tsv; do [[ -s "$target/$required" ]] || complete=0; done
+    for required in genome.fa genes/genes.gtf simpleaf/ref/t2g.tsv simpleaf/index/gene_id_to_name.tsv; do [[ -s "$target/$required" ]] || complete=0; done
     compgen -G "$target/simpleaf/index/piscem_idx*" >/dev/null || complete=0
     if (( complete )) && "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus rna-reference check --species "$species" --path "$target" >/dev/null 2>&1; then
       echo "RNA PG+45S reference already ready: $target"; return 0
@@ -402,7 +419,7 @@ rna_darlin_setup_reference() {
   rna_darlin_transaction_lock reference
   if [[ -n "$source_dir" ]]; then
     source_dir="$(cd "$source_dir" && pwd -P)"
-    for required in genome.fa genes/genes.gtf simpleaf/ref/t2g.tsv; do [[ -s "$source_dir/$required" ]] || { echo "ERROR: source reference lacks $required" >&2; return 1; }; done
+    for required in genome.fa genes/genes.gtf simpleaf/ref/t2g.tsv simpleaf/index/gene_id_to_name.tsv; do [[ -s "$source_dir/$required" ]] || { echo "ERROR: source reference lacks $required" >&2; return 1; }; done
     compgen -G "$source_dir/simpleaf/index/piscem_idx*" >/dev/null || { echo "ERROR: source reference lacks piscem index" >&2; return 1; }
     "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus rna-reference check --species "$species" --path "$source_dir"
     candidate="$(mktemp -d "$resource_root/${species}_reference.building.XXXXXXXX")"
@@ -442,6 +459,13 @@ rna_darlin_setup_reference() {
 # test 只验证当前生产 contract；不恢复已删除 helper、compatibility 或 identity gate。
 rna_darlin_test() (
   local python="${PYTHON:-$(command -v python3)}" unit_python validated=0 tmp required="${1:-0}"
+  local runtime_file
+  for runtime_file in README.md core/Snakefile core/doctor.sh core/run_pipeline.sh core/envs.yaml; do
+    [[ -f "$RNA_DARLIN_PIPELINE_ROOT/$runtime_file" && -r "$RNA_DARLIN_PIPELINE_ROOT/$runtime_file" ]] || {
+      echo "ERROR: missing or unreadable runtime file: $runtime_file" >&2
+      return 1
+    }
+  done
   unit_python="$python"
   if rna_darlin_check_env >/dev/null 2>&1; then
     python="$RNA_DARLIN_CONTROL_ENV/bin/python"
@@ -467,8 +491,10 @@ root=Path(sys.argv[1]); from lemmus import config as p
 envs=yaml.safe_load((root/'core/envs.yaml').read_text()); assert set(envs)=={'control','rules','atlas','calling'}
 schema=yaml.safe_load(p.CONFIG_SCHEMA_YAML)
 jsonschema.Draft202012Validator.check_schema(schema)
-for protocol, template in p.CONFIG_TEMPLATES.items():
-    cfg=yaml.safe_load(template)
+jsonschema.Draft202012Validator.check_schema(p.config_document_schema())
+for protocol in p.PROTOCOLS:
+    cfg=yaml.safe_load(p.CONFIG_TEMPLATE_YAML)
+    cfg['pipeline_mode'] = protocol
     p.validate_config(cfg); jsonschema.Draft202012Validator(schema).validate(p.select_config(cfg))
     assert cfg['pipeline_mode'] == protocol
     print(f'{protocol} config: PASS')
@@ -476,9 +502,11 @@ print('envs/config/schema: PASS')
 PY
   echo "[4/6] Runtime behavior：合成输入自检，不代表真实数据验收"; "$unit_python" -m lemmus self-check
   echo "[5/6] stale dependency boundary：核对当前运行入口"
-  local stale=0
-  if grep -RInE 'core/(scripts|internal|profiles|envs/)|(^|[^[:alnum:]_/])src/|\.\.?/src/|pyproject\.toml|config\.template\.yaml|config\.schema\.yaml' "$RNA_DARLIN_PIPELINE_ROOT/core/Snakefile" "$RNA_DARLIN_PIPELINE_ROOT"/core/lemmus/*.py "$RNA_DARLIN_PIPELINE_ROOT/README.md"; then stale=1; fi
-  if grep -RInE '(^|[^[:alnum:]_])\.runtime([^[:alnum:]_]|$)' "$RNA_DARLIN_PIPELINE_ROOT/core/Snakefile" "$RNA_DARLIN_PIPELINE_ROOT"/core/lemmus/*.py "$RNA_DARLIN_PIPELINE_ROOT/README.md"; then stale=1; fi
+  local stale=0 pattern scan_rc
+  for pattern in 'core/(scripts|internal|profiles|envs/)|(^|[^[:alnum:]_/])src/|\.\.?/src/|pyproject\.toml|config\.template\.yaml|config\.schema\.yaml' '(^|[^[:alnum:]_])\.runtime([^[:alnum:]_]|$)'; do
+    if grep -RInE "$pattern" "$RNA_DARLIN_PIPELINE_ROOT/core/Snakefile" "$RNA_DARLIN_PIPELINE_ROOT"/core/lemmus/*.py "$RNA_DARLIN_PIPELINE_ROOT/README.md"; then stale=1
+    else scan_rc=$?; (( scan_rc == 1 )) || return "$scan_rc"; fi
+  done
   (( stale == 0 )) || { echo "ERROR: stale production reference found" >&2; return 1; }
   if (( validated )); then
     # 每个 case 建独立 Workflow；同一解释器复用 Snakemake/NumPy/Pandas 导入。

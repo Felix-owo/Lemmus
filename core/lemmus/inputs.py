@@ -15,12 +15,10 @@ from pathlib import Path
 import yaml
 from .paths import PIPELINE_ROOT
 from .config import (
-    CONFIG_TEMPLATES,
-    ConfigError,
+    CONFIG_TEMPLATE_YAML,
     DROPLET_WHITELIST_ROWS,
     DROPLET_WHITELIST_SHA256,
     MANIFEST_FIELDS,
-    PROTOCOLS,
     SAMPLE_ID_PATTERN,
     SAMPLE_MANIFEST_TEMPLATE,
     load_config,
@@ -550,28 +548,21 @@ def init_project_main(argv=None):
     """初始化项目目录、当前模板与指向真实 Pipeline 的 launcher 软连接。"""
     parser = argparse.ArgumentParser(prog="lemmus init-project")
     parser.add_argument("--project", type=Path, default=Path.cwd())
-    parser.add_argument("--protocol", choices=sorted(PROTOCOLS), required=True)
     args = parser.parse_args(argv)
     project = args.project.resolve()
     config_path = project / "00_config/config.yaml"
-    template_text = CONFIG_TEMPLATES[args.protocol]
+    template_text = CONFIG_TEMPLATE_YAML
     validate_config(yaml.safe_load(template_text))
     if config_path.exists():
         existing = load_config(config_path)
-        if existing["pipeline_mode"] != args.protocol:
-            raise ConfigError(
-                f"Existing project uses {existing['pipeline_mode']}; requested {args.protocol}. "
-                "Initialize a separate project for a different protocol; existing config was not changed."
-            )
-        print(f"保留已有 {args.protocol} 配置: {config_path}")
+        print(f"保留已有 {existing['pipeline_mode']} 配置: {config_path}")
     for relative in ("00_config", "01_raw/RNA", "01_raw/DARLIN", "02_work", "03_results", "04_logs", "05_tmp", "06_downstream"):
         (project / relative).mkdir(parents=True, exist_ok=True)
     defaults = {
         config_path: template_text,
         project / "00_config/sample_manifest.tsv": SAMPLE_MANIFEST_TEMPLATE,
+        project / "00_config/Barcode_Map.csv": (PIPELINE_ROOT / "resources/Barcode_Map.csv").read_text(encoding="utf-8"),
     }
-    if args.protocol == 'cabernet':
-        defaults[project / "00_config/Barcode_Map.csv"] = (PIPELINE_ROOT / "resources/Barcode_Map.csv").read_text(encoding="utf-8")
     for path, payload in defaults.items():
         if not path.exists():
             path.write_text(payload, encoding="utf-8")
@@ -581,13 +572,12 @@ def init_project_main(argv=None):
         launcher.symlink_to(pipeline_launcher)
     elif not launcher.is_symlink():
         print(f"WARNING: {launcher} 已存在且不是软连接，未替换。")
-    print(f"项目已初始化: {project} (protocol={args.protocol})")
+    print(f"项目已初始化: {project}")
     print("下一步:")
-    if args.protocol == 'droplet':
-        print("  1. 检查 Droplet config.yaml；将 R1=CB17+UMI12、R2=cDNA 的 FASTQ 放入 01_raw/RNA/")
-        print("     运行前用 core/doctor.sh calling 准备 calling 环境和官方 ME5 白名单。")
-    else:
-        print("  1. 检查 Cabernet config.yaml 与 Barcode_Map.csv；RNA FASTQ 放入 01_raw/RNA/，targeted DARLIN FASTQ 放入 01_raw/DARLIN/")
+    print("  1. 编辑 00_config/config.yaml 的 pipeline_mode（默认 cabernet，可选 droplet）及对应模块。")
+    print("     Cabernet 检查 Barcode_Map.csv；RNA-only 设 cabernet.DARLIN.enabled=false。")
+    print("     Droplet 使用 R1=CB17+UMI12、R2=cDNA；运行前用 core/doctor.sh calling 准备环境和 ME5 白名单。")
+    print("     RNA FASTQ 放入 01_raw/RNA/，targeted DARLIN FASTQ 放入 01_raw/DARLIN/。")
     print("  2. ./run_pipeline.sh --refresh-manifest")
     print("  3. ./run_pipeline.sh --dry-run")
     print("  4. ./run_pipeline.sh")

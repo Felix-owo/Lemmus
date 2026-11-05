@@ -453,10 +453,15 @@ rule simpleaf_quant:
         t2g=str(SIMPLEAF_T2G),
         competitor=str(SIMPLEAF_REFERENCE / "ref" / "rrna_competitor.json")
     output:
-        h5ad=temp(str(QUANT_DIR / "{sample}" / "af_quant" / "alevin" / "quants.h5ad")),
+        mtx=str(QUANT_DIR / "{sample}" / "af_quant" / "alevin" / "quants_mat.mtx"),
+        rows=str(QUANT_DIR / "{sample}" / "af_quant" / "alevin" / "quants_mat_rows.txt"),
+        cols=str(QUANT_DIR / "{sample}" / "af_quant" / "alevin" / "quants_mat_cols.txt"),
+        features=str(QUANT_DIR / "{sample}" / "af_quant" / "featureDump.txt"),
+        collate_json=str(QUANT_DIR / "{sample}" / "af_quant" / "collate.json"),
+        simpleaf_map=str(QUANT_DIR / "{sample}" / "af_quant" / "simpleaf_map_info.json"),
         quant_json=str(QUANT_DIR / "{sample}" / "af_quant" / "quant.json"),
         map_info=str(QUANT_DIR / "{sample}" / "af_map" / "map_info.json"),
-        permit_qc=str(QUANT_DIR / "{sample}" / "af_quant" / "generate_permit_list.json") if IS_DROPLET else [],
+        permit_qc=str(QUANT_DIR / "{sample}" / "af_quant" / "generate_permit_list.json"),
         scratch=temp([str(QUANT_DIR / "{sample}" / p) for p in (
             "af_map/map.rad", "af_map/unmapped_bc_count.bin", "af_quant/map.collated.rad",
             "af_quant/correction_plan.bin", "af_quant/permit_freq.bin", "af_quant/permit_map.bin",
@@ -492,19 +497,47 @@ rule simpleaf_quant:
             --t2g-map {input.t2g:q} \
             --resolution {params.resolution:q} {params.small_thresh} \
             --threads {threads} \
-            --anndata-out \
             --output {params.output_dir:q} \
             >> {log:q} 2>&1
-        test -s {output.h5ad:q}
+        test -s {output.mtx:q}
         test -s {output.quant_json:q}
         test -s {output.map_info:q}
+        """
+
+
+rule export_rna_counts:
+    """原生计数导出与定量分离；参考注释直接读取，不依赖原生文件复制。"""
+    input:
+        mtx=rules.simpleaf_quant.output.mtx,
+        rows=rules.simpleaf_quant.output.rows,
+        cols=rules.simpleaf_quant.output.cols,
+        features=rules.simpleaf_quant.output.features,
+        quant_json=rules.simpleaf_quant.output.quant_json,
+        collate_json=rules.simpleaf_quant.output.collate_json,
+        simpleaf_map=rules.simpleaf_quant.output.simpleaf_map,
+        permit_qc=rules.simpleaf_quant.output.permit_qc,
+        gene_map=str(SIMPLEAF_INDEX / "gene_id_to_name.tsv")
+    output:
+        h5ad=temp(str(QUANT_DIR / "{sample}" / "af_quant" / "alevin" / "quants.h5ad"))
+    log:
+        str(LOG_DIR / "{sample}.export_rna_counts.log")
+    resources:
+        mem_mb=RNA_MEM_MB,
+        runtime=30
+    params:
+        quant_dir=lambda wildcards: str(QUANT_DIR / wildcards.sample / "af_quant")
+    shell:
+        """
+        python -m lemmus export-rna-counts \
+          --quant-dir {params.quant_dir:q} --gene-map {input.gene_map:q} \
+          --output {output.h5ad:q} > {log:q} 2>&1
         """
 
 
 rule prepare_rna_counts:
     """保存45S技术计数，并为调用及下游发布纯生物gene矩阵。"""
     input:
-        h5ad=rules.simpleaf_quant.output.h5ad,
+        h5ad=rules.export_rna_counts.output.h5ad,
         quant_json=rules.simpleaf_quant.output.quant_json,
         competitor=str(SIMPLEAF_REFERENCE / "ref" / "rrna_competitor.json")
     output:
@@ -1162,7 +1195,7 @@ rule rna_fastqc_raw_reads:
     threads: 1
     resources:
         mem_mb=2048,
-        runtime=60
+        runtime=720
     params:
         outdir=RNA_FASTQC_DIR,
         link=lambda wildcards: RNA_FASTQC_LINK_DIR / f"{wildcards.sample}_{wildcards.read}.fastq.gz",

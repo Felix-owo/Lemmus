@@ -63,7 +63,21 @@ def select_config(payload: dict[str, Any]) -> dict[str, Any]:
     common = {key: value for key, value in payload.items() if key not in modules}
     if set(payload[mode]) - settings:
         raise ConfigError(f'Unsupported setting in {mode} module: {sorted(set(payload[mode]) - settings)}')
-    return copy.deepcopy({**common, **payload[mode]})
+    active = copy.deepcopy({**common, **payload[mode]})
+    if not isinstance(active.get('RNA'), dict):
+        raise ConfigError(f'{mode}.RNA must be a mapping')
+    fixed_rna = {'resolution'} | ({'min_reads', 'expected_orientation'} if mode == 'droplet' else set())
+    if fixed_rna.intersection(active['RNA']):
+        raise ConfigError(f'{mode}.RNA contains fixed settings: {sorted(fixed_rna.intersection(active["RNA"]))}')
+    if mode == 'droplet' and {'DARLIN', 'QC', 'barcode_map'}.intersection(payload[mode]):
+        raise ConfigError('droplet only accepts tunable RNA settings; DARLIN/QC/barcode_map are not configurable')
+    # 固定科学策略只进入有效配置，不作为用户可调叶子展示。
+    active['RNA']['resolution'] = RNA_RESOLUTION
+    if mode == 'droplet':
+        active['RNA'].update(min_reads=1, expected_orientation='rc')
+        active['DARLIN'] = {'enabled': False}
+        active['QC'] = {'read_fate': {'enabled': False}}
+    return active
 
 
 def config_document_schema() -> dict[str, Any]:
@@ -74,12 +88,17 @@ def config_document_schema() -> dict[str, Any]:
     common_keys = ('schema_version', 'pipeline_mode', 'raw_data_dir', 'sample_manifest', 'paths', 'slurm')
     properties = {key: copy.deepcopy(active['properties'][key]) for key in common_keys}
     for mode in ('cabernet', 'droplet'):
-        keys = module_keys if mode == 'cabernet' else module_keys[:-1]
+        keys = module_keys if mode == 'cabernet' else ('RNA',)
         properties[mode] = {
             'type': 'object', 'additionalProperties': False,
             'required': list(keys),
             'properties': {key: copy.deepcopy(active['properties'][key]) for key in keys},
         }
+        rna_properties = properties[mode]['properties']['RNA']['properties']
+        del rna_properties['resolution']
+        if mode == 'droplet':
+            del rna_properties['min_reads']
+            del rna_properties['expected_orientation']
     return {'type': 'object', 'additionalProperties': False,
             'required': [*common_keys, 'cabernet', 'droplet'], 'properties': properties}
 
@@ -252,7 +271,6 @@ cabernet:
     # Standard 3' scRNA-seq: R1=cDNA; R2=CB+UMI. CB length is inferred from Barcode_Map.csv; UMI=8 bp.
     min_reads: 10
     expected_orientation: both
-    resolution: parsimony-gene
 
   DARLIN:
     enabled: true
@@ -294,24 +312,7 @@ droplet:  # 对应 Alopex analysis.protocol: droplet；共享 ME5 设计，DNA/R
     # quant_threads: 16  # Optional explicit quant budget; default = cores, 1..cores.
     mem_mb: 49152
     runtime: 720
-    min_reads: 1                     # Fixed: retain background for emptyDrops.
-    expected_orientation: rc         # Fixed DD-MET5 orientation.
-    resolution: parsimony-gene    # 固定：拒绝无法唯一归属的多gene分子，不运行EM。
-
-  DARLIN:
-    enabled: false                  # Fixed: DD-MET5 has no DARLIN branch.
-
-  QC:
-    read_fate:
-      enabled: false                # Fixed: trim/native quantification provide QC.
-
 """
-
-
-CONFIG_TEMPLATES = {
-    protocol: CONFIG_TEMPLATE_YAML.replace("pipeline_mode: cabernet\n", f"pipeline_mode: {protocol}\n", 1)
-    for protocol in ("cabernet", "droplet")
-}
 
 
 CONFIG_SCHEMA_YAML = r"""$schema: https://json-schema.org/draft/2020-12/schema

@@ -1,12 +1,14 @@
 # Lemmus
 
-当前版本为Git tag `v5.12`，正式发行包以包内README为准。源码计算位于`core/lemmus/`，下游实现归其`downstream/`子包，顶层`downstream/`只承载Notebook。
+当前版本为Git tag `v5.13`，正式发行包以包内README为准。源码计算位于`core/lemmus/`，下游实现归其`downstream/`子包，顶层`downstream/`只承载Notebook。
 
 Cabernet和Droplet都固定使用 **PG（parsimony-gene）＋物种对应45S竞争参考**。PG拒绝残余多gene歧义，不运行EM，也不将原始分子数取整。支持hg38（人NR_146144.1）与mm10（小鼠NR_046233.2），固定序列及来源见 [45S参考](resources/rrna/README.md)。技术feature `RRNA45S_COMPETITOR` 的计数单独保存在obs/uns；`biological.h5ad`、细胞调用及下游表达不含该feature。它不是生物学单拷贝gene；零技术计数不能证明没有rRNA污染。
 
+定量先保留原生 MTX 和完整条码/基因轴，独立步骤直接读取原参考注释并原子导出 H5AD；不依赖 Simpleaf 在输出目录复制的 gene map。格式导出不改变分子算法、计数或顺序，空背景条码未定义的 QC 比率保留为 NaN。
+
 本版本采用上述策略；已有其它resolution配置需在Pipeline外明确调整，旧index须用Doctor重建，历史结果不自动重算或覆盖。
 
-Lemmus v5.12（原 RNA_DARLIN_Pipeline）是从 Camellia 拆出的独立 RNA + targeted DARLIN workflow，基于 Snakemake。它可以完成：
+Lemmus v5.13（原 RNA_DARLIN_Pipeline）是从 Camellia 拆出的独立 RNA + targeted DARLIN workflow，基于 Snakemake。它可以完成：
 
 - RNA：Cabernet 3′ 与 DD-MET5 Droplet RNA 独立调用和定量（simpleaf 单一 backend）；
 - DARLIN：targeted lineage barcode 的 streaming 提取、UMI 级等位基因共识与 directional clone denoising；
@@ -32,7 +34,7 @@ Cabernet RNA 路径按标准 TSO-based 3′ UMI scRNA-seq 处理，不再保留 
 从 GitHub 下载 Pipeline
   → 准备物种 FASTA + GTF
   → 运行 Doctor（conda 构建 / reference 构建 / 回归测试）
-  → 显式选择协议初始化项目（--init-project --protocol cabernet 或 droplet）
+  → 初始化项目（--init-project），在 config 的 pipeline_mode 选择方案
   → 检查 config.yaml；Cabernet 检查 Barcode_Map.csv
   → 将 RNA / DARLIN paired FASTQ 放入 01_raw/
   → 刷新并检查 sample_manifest.tsv
@@ -44,18 +46,18 @@ Cabernet RNA 路径按标准 TSO-based 3′ UMI scRNA-seq 处理，不再保留 
 
 ## 1. 从 GitHub 下载 Pipeline
 
-从 [v5.12 Release](https://github.com/Felix-owo/Lemmus/releases/tag/v5.12) 下载 `Lemmus-v5.12.tar.gz` 和 `SHA256SUMS`，校验后解压：
+从 [v5.13 Release](https://github.com/Felix-owo/Lemmus/releases/tag/v5.13) 下载 `Lemmus-v5.13.tar.gz` 和 `SHA256SUMS`，校验后解压：
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Lemmus-v5.12.tar.gz
-cd Lemmus-v5.12
+tar -xzf Lemmus-v5.13.tar.gz
+cd Lemmus-v5.13
 ```
 
 也可使用正式 tag 获取代码：
 
 ```bash
-git clone --branch v5.12 --single-branch https://github.com/Felix-owo/Lemmus.git
+git clone --branch v5.13 --single-branch https://github.com/Felix-owo/Lemmus.git
 cd Lemmus
 ```
 
@@ -102,6 +104,10 @@ HPC 标准顺序与 Alopex 一致：
 2. 在登录节点提前下载和准备 Conda 等依赖。运行 `bash core/doctor.sh conda` 准备环境及固定白名单，再运行 `bash core/doctor.sh atlas` 准备 Census model、基因映射、当前参数的 balanced reference embedding 和 Cell Ontology；正确资源原样复用。
 3. 在**现有 JupyterLab 的 Terminal** 中进入 Pipeline 根目录，运行 `bash core/doctor.sh`。完整 Doctor 与科学调用在 Jupyter 的原 allocation 中执行，不在登录节点运行，不另起独立 Doctor allocation。
 
+已建环境的检查只读核对安装版本、平台和必需程序，不重复导入 Atlas 科学模块或启动 R 查询版本；创建时仍完整验证，后续参考、自检和 DAG 检查照常执行。
+
+HPC 更新保留来源仓库的真实 `.git` 与历史，核对正式 tag、commit、工作树和逐文件 SHA256，先审查保留已有本地修改。
+
 普通部署只要求更新 Pipeline 后跑通标准 Doctor，不默认追加全仓开发回归或额外 benchmark。代理日志、沙箱和备份统一留在已授权的 `MethylTreeAgent` 工作根。
 
 本机无参 Doctor 准备并检查全部资源。HPC 计算节点无参 Doctor 只读检查预先准备的四环境、白名单与 Census 离线参考，复用或从本地输入构建 PG＋45S，检查 Cabernet/Droplet × hg38/mm10 四个完整 DAG、跨 Pipeline 身份和当前目录项目参考。缺资源、损坏或参数不匹配均非零退出，不跳过必需检查；配置模板只读，不修改已有项目配置或科学结果。
@@ -130,29 +136,20 @@ Doctor 的 PASS 与告警未验证应分别核对；跨 Pipeline 检查通过仅
 
 ## 4. 创建分析项目
 
-Pipeline 安装目录与数据项目目录应分开。初始化必须显式选择协议，不能只靠 `expected_orientation: rc` 判断文库类型。同一份[内置配置模板](core/lemmus/config.py) 同时展示 `cabernet:` 和 `droplet:` 两个模块；顶部 `pipeline_mode` 只选择其中一组，参数不会跨模块继承。初始化写入这份完整配置，并设置所选模式。
-
-### DD-MET5 Droplet 项目
+Pipeline 安装目录与数据项目目录应分开。在新项目目录执行：
 
 ```bash
-mkdir -p /path/to/DropletProject
-cd /path/to/DropletProject
-/path/to/Lemmus/core/run_pipeline.sh --init-project --protocol droplet
+mkdir -p /path/to/Project
+cd /path/to/Project
+/path/to/Lemmus/core/run_pipeline.sh --init-project
 ```
 
-生成含两个模块、默认选择 Droplet 的 `00_config/config.yaml`、`sample_manifest.tsv`；不生成 `Barcode_Map.csv`。运行前使用 `core/doctor.sh calling` 准备独立 calling 环境与官方 ME5 白名单。
+初始化生成 `00_config/config.yaml`、`sample_manifest.tsv`、`Barcode_Map.csv`，以及指向 Pipeline 的 `run_pipeline.sh` 软连接和 `01_raw/` 至 `06_downstream/` 工作目录。同一份[内置配置模板](core/lemmus/config.py) 同时包含 `cabernet:` 和 `droplet:` 两个子集；顶部 `pipeline_mode` 默认为 `cabernet`，运行前在 config 中选择方案并调整对应子集，参数不会跨模块继承。
 
-### Cabernet 项目
+- Cabernet：检查 `Barcode_Map.csv`；RNA-only 项目设 `cabernet.DARLIN.enabled: false`。
+- DD-MET5 Droplet：设 `pipeline_mode: droplet`，检查 `droplet.RNA.reference`；运行前用 `core/doctor.sh calling` 准备 calling 环境与官方 ME5 白名单。此方案不读取项目中的 `Barcode_Map.csv`。
 
-```bash
-mkdir -p /path/to/CabernetProject
-cd /path/to/CabernetProject
-/path/to/Lemmus/core/run_pipeline.sh --init-project --protocol cabernet
-```
-
-生成含两个模块、默认选择 Cabernet 的 `00_config/config.yaml`、`sample_manifest.tsv` 和 `Barcode_Map.csv`。RNA-only Cabernet 项目在 `cabernet.DARLIN.enabled` 处设为 false。
-
-两种项目均生成指向 Pipeline 的 `run_pipeline.sh` 软连接以及 `01_raw/`、`02_work/`、`03_results/`、`04_logs/`、`05_tmp/` 和 `06_downstream/` 工作目录。后续命令从各自项目目录执行。重复初始化会保留已有配置；显式协议与已有配置不一致时拒绝操作，不覆盖结果或配置。`--protocol` 仅用于初始化，运行阶段以项目 config 为准。
+重复初始化会逐字节保留已有合法配置、manifest 和 barcode map；已有配置非法时在任何项目写入前失败。初始化不接收 `--protocol`，后续命令从项目目录执行。新模板只展示可调项，固定科学策略由程序提供；模块内显式填写固定项会被拒绝，已有配置的调整在 Pipeline 外完成，不自动改写科学结果。
 
 ## 5. 同一份 config.yaml 的两个模块
 
@@ -163,7 +160,7 @@ cabernet:
   # 孔板文库的 barcode_map、RNA、DARLIN、QC 参数
   ...
 droplet:
-  # DD-MET5 的 RNA、DARLIN、QC 参数
+  # DD-MET5 的可调 RNA 参数
   ...
 ```
 
@@ -181,14 +178,6 @@ droplet:
     cores: 16
     mem_mb: 49152
     runtime: 720
-    min_reads: 1
-    expected_orientation: rc
-    resolution: parsimony-gene
-  DARLIN:
-    enabled: false
-  QC:
-    read_fate:
-      enabled: false
 ```
 
 | 配置 | Droplet 含义 |
@@ -197,12 +186,8 @@ droplet:
 | `RNA.cores` | local 总 CPU 预算，模板 16。 |
 | `RNA.quant_threads` | 可选定量线程预算，缺省等于 cores，范围 `1..cores`。 |
 | `RNA.mem_mb` / `RNA.runtime` | 定量资源，模板为 49152 MiB / 720 分钟；local 并发同时受 cores 和 mem_mb 约束。 |
-| `RNA.min_reads` | **固定 1**，保留 emptyDrops 背景。 |
-| `RNA.expected_orientation` | **固定 rc**，geometry 自动为 `1{b[17]u[12]x:}2{r:}`。 |
-| `RNA.resolution` | **固定 parsimony-gene**，不运行多gene EM。 |
-| `DARLIN.enabled` / `QC.read_fate.enabled` | **固定 false**；由修剪与原生定量提供配对/条码审计。 |
 
-`droplet:` 模块不包含 `barcode_map`、DARLIN primer/template/extraction 参数或孔板 double-cell 参数。它们仅出现在 `cabernet:` 模块，选择 Droplet 时不会读取它们。
+Droplet 固定保留背景（min_reads=1）、使用 rc 方向与 PG 分子解析，并禁用 DARLIN 和可选 read-fate 全表。这些是内部策略，不是配置项；`droplet:` 只接受可调 RNA 字段，不包含 `barcode_map`、`DARLIN` 或 `QC`。两种方案均不接受模块内的 `RNA.resolution`，PG 固定由程序提供。
 
 ### Cabernet 配置
 
@@ -219,7 +204,6 @@ cabernet:
     runtime: 720
     min_reads: 10
     expected_orientation: both
-    resolution: parsimony-gene
   DARLIN:
     enabled: true
 ```
@@ -233,7 +217,6 @@ cabernet:
 | `RNA.mem_mb` / `RNA.runtime` | 定量资源，模板为 16384 MiB / 720 分钟。 |
 | `RNA.min_reads` | canonical whitelist 的原生 permit-list read 门槛，默认 10。 |
 | `RNA.expected_orientation` | 接受 `fw` / `rc` / `both`，默认 `both`；改成 rc 不会改变 Cabernet 读端结构。 |
-| `RNA.resolution` | 固定 `parsimony-gene`，其它值拒绝。 |
 | `DARLIN.enabled` | 默认 true；没有 targeted DARLIN 文库时设 false。 |
 
 DARLIN 提取参数（`DARLIN.extraction.chunk_size` 等）的默认值集中定义在 `lemmus.config.DEFAULT_EXTRACTION`，由 Snakefile 导入使用；`cabernet:` 模块列出常用项，一般项目无需调整。
