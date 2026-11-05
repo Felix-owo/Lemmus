@@ -20,9 +20,11 @@ format. Deterministic resolution does not establish the biological source of
 intrinsically ambiguous molecules.
 
 Doctor verifies the selected binary SHA256, performs a real five-read
-forward/reverse PG smoke, and atomically installs into a candidate rules prefix.
-An existing rules environment is cloned before publication; active jobs retain
-their old physical prefix. Repeated checks execute only the lightweight contract
+forward/reverse PG smoke, and atomically installs under
+`conda/native-quantifier/<SHA256>/bin/alevin-fry`. Simpleaf explicitly binds this
+immutable artifact; the DAG tracks the artifact and distribution manifest.
+Existing Conda environments and active jobs retain their original programs;
+updating this single native artifact does not clone an environment. Repeated checks execute only the lightweight contract
 query. Runtime preparation never compiles Rust or downloads native source.
 
 ## Source build

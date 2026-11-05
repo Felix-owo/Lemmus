@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import struct
 import subprocess
@@ -36,6 +37,8 @@ def _distribution():
     if key is None or key not in data["platforms"]:
         raise ValueError("No validated native RNA distribution for this platform")
     record = data["platforms"][key]
+    if not isinstance(record.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", record["sha256"]):
+        raise ValueError("Invalid native RNA artifact SHA256 identity")
     binary = (root / record["path"]).resolve(strict=True)
     if not binary.is_relative_to(root.resolve()):
         raise ValueError("Native RNA distribution path escapes its resource root")
@@ -56,9 +59,19 @@ def _check_binary(binary: Path):
         )
 
 
-def check_quantifier(prefix: Path):
+def managed_quantifier_prefix() -> Path:
+    """按发行工件身份保存独立原生程序，避免为一个可执行文件克隆 Conda。"""
+    _, digest = _distribution()
+    return PIPELINE_ROOT / "conda/native-quantifier" / digest
+
+
+def managed_quantifier_path() -> Path:
+    return managed_quantifier_prefix() / "bin/alevin-fry"
+
+
+def check_quantifier(prefix: Path | None = None):
     """只执行轻量契约查询；不访问 Conda solver、网络或科学参考。"""
-    _check_binary(prefix / "bin/alevin-fry")
+    _check_binary((prefix if prefix is not None else managed_quantifier_prefix()) / "bin/alevin-fry")
 
 
 def _smoke(binary: Path, scratch: Path):
@@ -142,8 +155,9 @@ def _smoke(binary: Path, scratch: Path):
             raise ValueError("Native RNA smoke changed gene identity")
 
 
-def prepare_quantifier(prefix: Path):
+def prepare_quantifier(prefix: Path | None = None):
     """核验固定发行工件和真实原生行为后原子替换；失败保留原程序。"""
+    prefix = prefix if prefix is not None else managed_quantifier_prefix()
     try:
         check_quantifier(prefix)
         return
@@ -155,6 +169,7 @@ def prepare_quantifier(prefix: Path):
         )
     source, expected = _distribution()
     target = prefix / "bin/alevin-fry"
+    target.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix=".alevin-fry.", dir=target.parent)
     candidate = Path(name)
     try:
@@ -173,9 +188,12 @@ def prepare_quantifier(prefix: Path):
 
 def native_quantifier_main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("operation", choices=("check", "prepare"))
-    parser.add_argument("--prefix", type=Path, required=True)
+    parser.add_argument("operation", choices=("check", "prepare", "path"))
+    parser.add_argument("--prefix", type=Path)
     args = parser.parse_args(argv)
+    if args.operation == "path":
+        print((args.prefix or managed_quantifier_prefix()) / "bin/alevin-fry")
+        return 0
     if args.operation == "check":
         check_quantifier(args.prefix)
     else:

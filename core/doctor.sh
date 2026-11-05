@@ -110,52 +110,16 @@ rna_darlin_require_login_for_conda() {
 
 # 固定 PG 契约独立于 Conda 包版本；重复检查只运行轻量只读查询。
 rna_darlin_native_quantifier() {
-  local operation="$1" prefix="$RNA_DARLIN_RULE_ENV"
-  if (( $# == 2 )); then prefix="$2"; fi
-  "$RNA_DARLIN_CONTROL_ENV/bin/python" -m lemmus native-quantifier "$operation" --prefix "$prefix"
+  PYTHONPATH="$RNA_DARLIN_PIPELINE_ROOT/core" "$RNA_DARLIN_CONTROL_ENV/bin/python" -m lemmus native-quantifier "$@"
 }
 
-# 只克隆 rules 并原子切换，保持运行任务引用的旧环境不变。
+# 原生工件按 SHA256 独立安装；不克隆或改写已有 Conda 环境。
 rna_darlin_setup_quantifier() (
   rna_darlin_native_quantifier check >/dev/null 2>&1 && return 0
   rna_darlin_require_login_for_conda || return $?
-  rna_darlin_transaction_lock environments || return $?
-  local generation root control rules atlas
-  generation="native-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  root="$RNA_DARLIN_CONDA_ROOT/environments/$generation"
-  RNA_DARLIN_ACTIVE_CANDIDATE="$root"
-  mkdir -p "$root" || return $?
-  control="$(cd "$RNA_DARLIN_CONTROL_ENV" && pwd -P)" || return $?
-  atlas="$(cd "$RNA_DARLIN_ATLAS_ENV" && pwd -P)" || return $?
-  rules="$root/rules"
-  CONDA_ALWAYS_COPY=true CONDA_PKGS_DIRS="$RNA_DARLIN_CONDA_ROOT/package-cache" \
-    "$control/bin/conda" create --yes --clone "$RNA_DARLIN_RULE_ENV" --prefix "$rules" || return $?
-  ln -s "$control" "$root/control" || return $?
-  ln -s "$atlas" "$root/atlas" || return $?
-  "$control/bin/python" -m lemmus native-quantifier prepare --prefix "$rules" || return $?
-  "$rules/bin/python" -c 'import anndata, hdf5plugin, numpy, pandas, pysam, yaml' || return $?
-  "$control/bin/python" - "$rules" <<'PYVERSIONS' || return $?
-import platform, sys, yaml
-from pathlib import Path
-from lemmus.maintenance import _check_environment_packages
-from lemmus.paths import PIPELINE_ROOT
-machine=platform.machine().lower()
-subdir=('osx' if sys.platform=='darwin' else 'linux')+'-'+('64' if machine=='x86_64' else machine)
-section=yaml.safe_load((PIPELINE_ROOT/'core/envs.yaml').read_text())['rules']
-_check_environment_packages(Path(sys.argv[1]), 'rules', subdir, section)
-PYVERSIONS
-  rna_darlin_rna_toolchain_smoke "$rules" || return $?
-  "$control/bin/python" - "$RNA_DARLIN_CONDA_ROOT/current" "environments/$generation" <<'PYACTIVATE' || return $?
-import os, sys
-from pathlib import Path
-active=Path(sys.argv[1]); temporary=active.with_name(f'.{active.name}.native.{os.getpid()}')
-try:
-    os.symlink(sys.argv[2], temporary)
-    os.replace(temporary, active)
-finally:
-    temporary.unlink(missing_ok=True)
-PYACTIVATE
-  RNA_DARLIN_ACTIVE_CANDIDATE=""
+  rna_darlin_transaction_lock native_quantifier || return $?
+  rna_darlin_native_quantifier prepare || return $?
+  rna_darlin_native_quantifier check || return $?
   rna_darlin_release_transaction_lock
 )
 
@@ -229,7 +193,8 @@ rna_darlin_rna_toolchain_smoke() {
 
 # Pipeline 使用显式 custom geometry 和项目 whitelist；固定空 registry，避免 simpleaf 隐式联网。
 rna_darlin_prepare_simpleaf_home() {
-  local home="$1" rules_env="$2" registry temporary
+  local home="$1" rules_env="$2" registry temporary native
+  native="$(rna_darlin_native_quantifier path)" || return $?
   registry="$home/chemistries.json"
   temporary="$home/.chemistries.json.tmp.$$"
   mkdir -p "$home"
@@ -237,7 +202,7 @@ rna_darlin_prepare_simpleaf_home() {
   mv "$temporary" "$registry"
   ALEVIN_FRY_HOME="$home" PATH="$rules_env/bin:$PATH" "$rules_env/bin/simpleaf" set-paths \
     --piscem "$rules_env/bin/piscem" \
-    --alevin-fry "$rules_env/bin/alevin-fry" >/dev/null
+    --alevin-fry "$native" >/dev/null
 }
 
 # simpleaf 0.28 的 splici index 只生成 USA 三列 t2g；生产定量需要标准两列 transcript->gene 映射。
@@ -326,7 +291,7 @@ rna_darlin_setup_conda() (
   for exe in "${RNA_DARLIN_RULE_EXECUTABLES[@]}"; do [[ -x "$rules/$exe" ]] || { echo "ERROR: candidate missing $exe" >&2; return 1; }; done
   PATH="$rules/bin:$rules/lib/jvm/bin:$PATH" "$rules/bin/fastqc" --version >/dev/null
   PATH="$rules/bin:$rules/lib/jvm/bin:$PATH" "$rules/bin/multiqc" --version >/dev/null
-  "$control/bin/python" -m lemmus native-quantifier prepare --prefix "$rules"
+  PYTHONPATH="$RNA_DARLIN_PIPELINE_ROOT/core" "$control/bin/python" -m lemmus native-quantifier prepare
   rna_darlin_rna_toolchain_smoke "$rules"
   rm -rf -- "$setup"
   "$control/bin/python" - "$RNA_DARLIN_CONDA_ROOT/current" "environments/$generation" <<'PY'

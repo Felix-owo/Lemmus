@@ -18,6 +18,7 @@ from lemmus.config import validate_config,select_config
 from lemmus.inputs import map_fastq_pairs_to_manifest, read_manifest, require_fastq_pairs
 from lemmus.config import PROTOCOLS,get_protocol
 from lemmus.inputs import droplet_whitelist_path
+from lemmus.native import managed_quantifier_path
 from lemmus.rna import droplet_geometry
 from lemmus.rna import validate_rna_reference
 from lemmus.config import RNA_RESOLUTION as PRODUCTION_RNA_RESOLUTION, RNA_GENE_EC_ORDER
@@ -448,6 +449,7 @@ def quant_r2(wildcards):
 rule simpleaf_quant:
     input:
         native_distribution=str(PIPELINE_ROOT / "resources" / "alevin-fry" / "distribution.json"),
+        native_quantifier=str(managed_quantifier_path()),
         r1=quant_r1,
         r2=quant_r2,
         whitelist=rules.write_rna_whitelist.output.whitelist,
