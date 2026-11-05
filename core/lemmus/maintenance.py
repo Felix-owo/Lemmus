@@ -87,7 +87,7 @@ cat(capture.output(sessionInfo()), sep="\\n")
 
 
 def check_calling_main(argv=None):
-    """读取 R 包 DESCRIPTION 核对版本；重复检查不启动 R 会话。"""
+    """读取 R 描述与 ISA-L 发行元数据；重复检查不启动 R 或科学模块。"""
     from email.parser import Parser
     import re
     parser = argparse.ArgumentParser(prog='lemmus check-calling')
@@ -108,7 +108,16 @@ def check_calling_main(argv=None):
         versions[package] = parts
     if not ((4, 5) <= versions['base'] < (4, 6) and versions['DropletUtils'] == (1, 30)):
         raise ValueError('Calling requires R>=4.5,<4.6 and DropletUtils1.30.0')
-    print('Calling package versions: PASS (R4.5 / DropletUtils1.30.0)')
+    from importlib.metadata import Distribution
+    from packaging.version import Version
+    site = args.prefix / 'lib/python3.12/site-packages'
+    distributions = list(Distribution.discover(name='isal', path=[str(site)]))
+    if (len(distributions) != 1
+            or distributions[0].metadata['Name'].lower() != 'isal'
+            or Path(distributions[0].locate_file('')).resolve() != site.resolve()
+            or not (Version('1.8') <= Version(distributions[0].version) < Version('2'))):
+        raise ValueError('Calling requires effective python-isal>=1.8,<2 in its managed prefix')
+    print('Calling package versions: PASS (R4.5 / DropletUtils1.30.0 / python-isal)')
     return 0
 
 

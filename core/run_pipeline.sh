@@ -93,6 +93,8 @@ if [[ "$PIPELINE_MODE" == droplet ]]; then
   LOCAL_ARGS+=(--resources "mem_mb=$RNA_MEM_MB")
 fi
 
+rna_darlin_native_quantifier check || { echo "ERROR: RNA quantifier requires login-node preparation: bash core/doctor.sh conda" >&2; exit 127; }
+
 export RNA_DARLIN_CONFIG="$CONFIG" RNA_DARLIN_PROJECT_DIR="$PROJECT" RNA_DARLIN_RULE_ENV="$RULE_ENV"
 export PATH="$RULE_ENV/bin:$RULE_ENV/lib/jvm/bin:$CONTROL_ENV/bin:$PATH" PYTHONNOUSERSITE=1
 export XDG_CACHE_HOME="$PROJECT/05_tmp/xdg_cache" MPLCONFIGDIR="$PROJECT/05_tmp/matplotlib"

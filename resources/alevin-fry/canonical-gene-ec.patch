@@ -1,0 +1,102 @@
+--- a/src/eq_class.rs
++++ b/src/eq_class.rs
+@@ -772,6 +772,26 @@
+ 
+             gvec.clear();
+         }
++        // EC identifiers become PUG vertex identities and decide equal-size cover
++        // ties through seeded hash iteration. First-observed read order is not
++        // biological evidence: assign EC identifiers by their gene labels instead.
++        self.eq_label_starts.push(self.eq_labels.len() as u32);
++        let entries = std::mem::take(&mut self.eqc_info);
++        let mut canonical: Vec<_> = entries.into_iter().enumerate()
++            .map(|(old_id, entry)| (self.refs_for_eqc(old_id as u32).to_vec(), entry))
++            .collect();
++        canonical.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
++        self.eq_labels.clear();
++        self.eq_label_starts.clear();
++        self.eqid_map.clear();
++        for (new_id, (labels, mut entry)) in canonical.into_iter().enumerate() {
++            entry.eq_num = new_id as u32;
++            self.eq_label_starts.push(self.eq_labels.len() as u32);
++            self.eq_labels.extend_from_slice(&labels);
++            self.eqid_map.insert(labels, entry.eq_num);
++            self.eqc_info.push(entry);
++        }
++
+         // final value to avoid special cases
+         self.eq_label_starts.push(self.eq_labels.len() as u32);
+ 
+@@ -1074,6 +1094,37 @@
+     use super::*;
+ 
+     #[test]
++    fn gene_level_pug_identity_does_not_depend_on_read_order() {
++        use libradicl::record::AlevinFryReadRecordT;
++        let records = vec![
++            (11179698_u64, vec![0, 1, 3]),
++            (11179698_u64, vec![0, 1, 3]),
++            (2791090_u64, vec![0, 2, 4]),
++            (11179634_u64, vec![1, 2, 3]),
++            (11179634_u64, vec![1, 2, 3]),
++        ];
++        let snapshot = |reverse: bool| {
++            let mut reads: Vec<_> = records.iter().map(|(umi, refs)| AlevinFryReadRecordT {
++                bc: 2329_u64, umi: *umi, dirs: vec![true; refs.len()], refs: refs.clone(),
++            }).collect();
++            if reverse { reads.reverse(); }
++            let mut chunk = libradicl::chunk::Chunk { nbytes: 0, nrec: reads.len() as u32, reads };
++            let mut eq = EqMap::new(5, EqMapType::GeneLevel, false);
++            eq.init_from_chunk_gene_level(&mut chunk, &[0, 1, 2, 3, 4]);
++            let result: Vec<_> = eq.eqc_info.iter().map(|e| (e.eq_num,
++                eq.refs_for_eqc(e.eq_num).to_vec(), e.umis.clone())).collect();
++            let reverse_map: Vec<_> = (0..5).map(|g| eq.eq_classes_containing(g).to_vec()).collect();
++            (result, reverse_map, eq.label_counts.clone())
++        };
++        let forward = snapshot(false);
++        let reverse = snapshot(true);
++        assert_eq!(forward, reverse);
++        assert_eq!(forward.0.iter().map(|x| x.1.clone()).collect::<Vec<_>>(),
++                   vec![vec![0,1,3], vec![0,2,4], vec![1,2,3]]);
++        assert_eq!(forward.0.iter().flat_map(|x| &x.2).map(|x| x.1).sum::<u32>(), 5);
++    }
++
++    #[test]
+     fn temp_prob_map_add() {
+         let mut tpm = TempProbMap::new();
+         tpm.push(0, &[0.5, 0.5]);
+--- a/src/quant.rs
++++ b/src/quant.rs
+@@ -2245,6 +2245,7 @@
+     "cmd" : quant_opts.cmdline,
+     "version_str": quant_opts.version,
+     "resolution_strategy" : resolution.to_string(),
++    "gene_level_ec_order" : if matches!(resolution, ResolutionStrategy::ParsimonyGene | ResolutionStrategy::ParsimonyGeneEm) { crate::PG_GENE_EC_ORDER } else { "not_applicable" },
+     "num_quantified_cells" : num_cells,
+     "num_genes" : num_rows,
+     "dump_eq" : dump_eq,
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -380,7 +380,13 @@
+         .subcommand(convert_app)
+         .subcommand(view_app)
+         .subcommand(atac_app)
++        .subcommand(Command::new("lemmus-contract").about("Report the projected-gene identity contract of the Lemmus distribution"))
+         .get_matches();
++
++    if opts.subcommand_matches("lemmus-contract").is_some() {
++        println!("{}", alevin_fry::PG_GENE_EC_ORDER);
++        return Ok(());
++    }
+ 
+     use alevin_fry::atac;
+     if let Some(t) = opts.subcommand_matches("atac") {
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -27,3 +27,6 @@
+ pub mod pugutils;
+ pub mod quant;
+ pub mod utils;
++
++/// Canonical projected-gene identities used by the Lemmus native distribution.
++pub const PG_GENE_EC_ORDER: &str = "lexicographic_gene_labels_v1";

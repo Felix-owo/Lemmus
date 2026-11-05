@@ -13,6 +13,7 @@ CONFIG_SCHEMA_VERSION = 2
 
 
 RNA_RESOLUTION = 'parsimony-gene'
+RNA_GENE_EC_ORDER = 'lexicographic_gene_labels_v1'
 
 
 RRNA_COMPETITOR_ID = 'RRNA45S_COMPETITOR'

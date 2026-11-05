@@ -15,13 +15,12 @@ import numpy as np
 import pandas as pd
 from .paths import PIPELINE_ROOT
 from .config import (
-    DROPLET_R2_ADAPTERS,
-    DROPLET_SOURCE_COMMIT,
     DROPLET_WHITELIST_ROWS,
     DROPLET_WHITELIST_SHA256,
     DROPLET_WHITELIST_URL,
     PROTOCOLS,
     RNA_RESOLUTION,
+    RNA_GENE_EC_ORDER,
     RRNA_COMPETITOR_ID,
     RRNA_REFERENCES,
     SAMPLE_ID_PATTERN,
@@ -37,73 +36,6 @@ from .inputs import (
 def droplet_geometry() -> str:
     """返回 DD-MET5 的物理 R1 条码和 UMI、物理 R2 表达序列布局。"""
     return '1{b[17]u[12]x:}2{r:}'
-
-
-def preprocess_droplet_rna(r1: Path, r2: Path, output_r1: Path, output_r2: Path, qc: Path) -> dict:
-    """按官方次序调用 Cutadapt 匹配器，配对流式清理 RNA 并记录互斥的 read-pair 去向。"""
-    import cutadapt
-    import dnaio
-    from cutadapt.adapters import BackAdapter, RightmostFrontAdapter
-    adapters = [BackAdapter(seq, max_errors=0.1, min_overlap=3) if end == '3'
-                else RightmostFrontAdapter(seq, max_errors=0.1, min_overlap=3)
-                for seq, end in DROPLET_R2_ADAPTERS]
-    destinations = (output_r1, output_r2, qc)
-    for path in destinations:
-        path.parent.mkdir(parents=True, exist_ok=True)
-    metrics = dict(input_pairs=0, short_cb_umi=0, invalid_cb=0, invalid_umi=0,
-                   short_r2=0, passed_pairs=0, adapter_trimmed_pairs=0)
-    hits = [0] * len(adapters)
-    started = time.monotonic()
-    with tempfile.TemporaryDirectory(prefix='.droplet-trim.', dir=output_r1.parent) as tmp:
-        a, b = Path(tmp) / 'R1.fq.gz', Path(tmp) / 'R2.fq.gz'
-        with dnaio.open(r1, r2) as reads, dnaio.open(a, b, mode='w', compression_level=1) as writer:
-            for first, second in reads:
-                metrics['input_pairs'] += 1
-                if len(first) < 29:
-                    metrics['short_cb_umi'] += 1
-                    continue
-                if set(first.sequence[:17]) - set('ACGT'):
-                    metrics['invalid_cb'] += 1
-                    continue
-                if set(first.sequence[17:29]) - set('ACGT'):
-                    metrics['invalid_umi'] += 1
-                    continue
-                trimmed = False
-                for i, adapter in enumerate(adapters):
-                    match = adapter.match_to(second.sequence)
-                    if match is not None:
-                        second = match.trimmed(second)
-                        hits[i] += 1
-                        trimmed = True
-                metrics['adapter_trimmed_pairs'] += int(trimmed)
-                if len(second) < 60:
-                    metrics['short_r2'] += 1
-                    continue
-                writer.write(first[:29], second)
-                metrics['passed_pairs'] += 1
-        if metrics['input_pairs'] != sum(metrics[k] for k in ('short_cb_umi','invalid_cb','invalid_umi','short_r2','passed_pairs')):
-            raise ValueError('DD-MET5 preprocessing pair accounting failed')
-        metrics.update(protocol='droplet', chemistry='DD-MET5', cutadapt_version=cutadapt.__version__,
-                       source_commit=DROPLET_SOURCE_COMMIT, adapters=list(DROPLET_R2_ADAPTERS),
-                       adapter_hits=hits, max_error_rate=0.1, min_overlap=3, min_r2_length=60,
-                       elapsed_seconds=time.monotonic()-started)
-        candidate_qc = Path(tmp) / 'qc.json'
-        candidate_qc.write_text(json.dumps(metrics, indent=2)+'\n')
-        qc.unlink(missing_ok=True)
-        os.replace(a, output_r1)
-        os.replace(b, output_r2)
-        os.replace(candidate_qc, qc)
-    return metrics
-
-
-def preprocess_droplet_main(argv=None):
-    """执行文库级 RNA 预处理；QC 最后提交，失败不得留下完成标记。"""
-    parser = argparse.ArgumentParser()
-    for arg in ('r1','r2','output-r1','output-r2','qc'):
-        parser.add_argument('--'+arg, type=Path, required=True)
-    args = parser.parse_args(argv)
-    preprocess_droplet_rna(args.r1, args.r2, args.output_r1, args.output_r2, args.qc)
-    return 0
 
 
 EMPTY_DROPS_R = r'''
@@ -349,8 +281,8 @@ def export_rna_counts(quant_dir: Path, gene_map: Path, output_h5ad: Path) -> Non
     import scipy.sparse as sp
 
     quant = json.loads((quant_dir / 'quant.json').read_text())
-    if quant.get('resolution_strategy') != 'ParsimonyGene' or quant.get('usa_mode') is not False:
-        raise ValueError('RNA export requires two-column parsimony-gene quantification')
+    if quant.get('resolution_strategy') != 'ParsimonyGene' or quant.get('usa_mode') is not False or quant.get('gene_level_ec_order') != RNA_GENE_EC_ORDER:
+        raise ValueError('RNA export requires two-column parsimony-gene quantification with canonical gene-equivalence identities')
     folder = quant_dir / 'alevin'
 
     def axis(name):
@@ -445,8 +377,8 @@ def prepare_rna_counts(input_h5ad: Path, quant_json: Path, reference: Path,
     import scipy.sparse as sp
     policy = validate_rna_reference(reference, species)
     quant = json.loads(quant_json.read_text())
-    if quant.get('resolution_strategy') != 'ParsimonyGene' or quant.get('usa_mode') is not False:
-        raise ValueError('Production RNA counts require two-column parsimony-gene quantification')
+    if quant.get('resolution_strategy') != 'ParsimonyGene' or quant.get('usa_mode') is not False or quant.get('gene_level_ec_order') != RNA_GENE_EC_ORDER:
+        raise ValueError('Production RNA counts require two-column parsimony-gene quantification with canonical gene-equivalence identities')
     data = ad.read_h5ad(input_h5ad)
     if not data.obs_names.is_unique or not data.var_names.is_unique:
         raise ValueError('RNA count cell/gene identities must be unique')
@@ -469,6 +401,7 @@ def prepare_rna_counts(input_h5ad: Path, quant_json: Path, reference: Path,
     biological.obs['rna45s_competitor_counts'] = sink
     biological.uns['rna_quantification'] = {**policy, 'count_semantics': 'native unrounded non-EM molecule counts',
         'quantifier_version': str(quant.get('version_str', 'not_recorded')),
+        'gene_level_ec_order': quant['gene_level_ec_order'],
         'background_competitor_count_sum': float(sink.sum()),
         'background_competitor_cells_positive': int((sink > 0).sum())}
     output_h5ad.parent.mkdir(parents=True, exist_ok=True)

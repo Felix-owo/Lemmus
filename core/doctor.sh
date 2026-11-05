@@ -108,6 +108,57 @@ rna_darlin_require_login_for_conda() {
   fi
 }
 
+# 固定 PG 契约独立于 Conda 包版本；重复检查只运行轻量只读查询。
+rna_darlin_native_quantifier() {
+  local operation="$1" prefix="$RNA_DARLIN_RULE_ENV"
+  if (( $# == 2 )); then prefix="$2"; fi
+  "$RNA_DARLIN_CONTROL_ENV/bin/python" -m lemmus native-quantifier "$operation" --prefix "$prefix"
+}
+
+# 只克隆 rules 并原子切换，保持运行任务引用的旧环境不变。
+rna_darlin_setup_quantifier() (
+  rna_darlin_native_quantifier check >/dev/null 2>&1 && return 0
+  rna_darlin_require_login_for_conda || return $?
+  rna_darlin_transaction_lock environments || return $?
+  local generation root control rules atlas
+  generation="native-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  root="$RNA_DARLIN_CONDA_ROOT/environments/$generation"
+  RNA_DARLIN_ACTIVE_CANDIDATE="$root"
+  mkdir -p "$root" || return $?
+  control="$(cd "$RNA_DARLIN_CONTROL_ENV" && pwd -P)" || return $?
+  atlas="$(cd "$RNA_DARLIN_ATLAS_ENV" && pwd -P)" || return $?
+  rules="$root/rules"
+  CONDA_ALWAYS_COPY=true CONDA_PKGS_DIRS="$RNA_DARLIN_CONDA_ROOT/package-cache" \
+    "$control/bin/conda" create --yes --clone "$RNA_DARLIN_RULE_ENV" --prefix "$rules" || return $?
+  ln -s "$control" "$root/control" || return $?
+  ln -s "$atlas" "$root/atlas" || return $?
+  "$control/bin/python" -m lemmus native-quantifier prepare --prefix "$rules" || return $?
+  "$rules/bin/python" -c 'import anndata, hdf5plugin, numpy, pandas, pysam, yaml' || return $?
+  "$control/bin/python" - "$rules" <<'PYVERSIONS' || return $?
+import platform, sys, yaml
+from pathlib import Path
+from lemmus.maintenance import _check_environment_packages
+from lemmus.paths import PIPELINE_ROOT
+machine=platform.machine().lower()
+subdir=('osx' if sys.platform=='darwin' else 'linux')+'-'+('64' if machine=='x86_64' else machine)
+section=yaml.safe_load((PIPELINE_ROOT/'core/envs.yaml').read_text())['rules']
+_check_environment_packages(Path(sys.argv[1]), 'rules', subdir, section)
+PYVERSIONS
+  rna_darlin_rna_toolchain_smoke "$rules" || return $?
+  "$control/bin/python" - "$RNA_DARLIN_CONDA_ROOT/current" "environments/$generation" <<'PYACTIVATE' || return $?
+import os, sys
+from pathlib import Path
+active=Path(sys.argv[1]); temporary=active.with_name(f'.{active.name}.native.{os.getpid()}')
+try:
+    os.symlink(sys.argv[2], temporary)
+    os.replace(temporary, active)
+finally:
+    temporary.unlink(missing_ok=True)
+PYACTIVATE
+  RNA_DARLIN_ACTIVE_CANDIDATE=""
+  rna_darlin_release_transaction_lock
+)
+
 # R 原生依赖仅在候选环境构建；成功核验后原子更新 calling 指针。
 rna_darlin_setup_calling() {
   local conda_bin="${RNA_DARLIN_CONTROL_ENV}/bin/conda"
@@ -275,6 +326,7 @@ rna_darlin_setup_conda() (
   for exe in "${RNA_DARLIN_RULE_EXECUTABLES[@]}"; do [[ -x "$rules/$exe" ]] || { echo "ERROR: candidate missing $exe" >&2; return 1; }; done
   PATH="$rules/bin:$rules/lib/jvm/bin:$PATH" "$rules/bin/fastqc" --version >/dev/null
   PATH="$rules/bin:$rules/lib/jvm/bin:$PATH" "$rules/bin/multiqc" --version >/dev/null
+  "$control/bin/python" -m lemmus native-quantifier prepare --prefix "$rules"
   rna_darlin_rna_toolchain_smoke "$rules"
   rm -rf -- "$setup"
   "$control/bin/python" - "$RNA_DARLIN_CONDA_ROOT/current" "environments/$generation" <<'PY'
@@ -470,6 +522,7 @@ rna_darlin_test() (
   if rna_darlin_check_env >/dev/null 2>&1; then
     python="$RNA_DARLIN_CONTROL_ENV/bin/python"
     unit_python="$RNA_DARLIN_RULE_ENV/bin/python"
+    rna_darlin_native_quantifier check || return $?
     validated=1
   fi
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/lemmus-selfcheck.XXXXXXXX")"; trap 'rm -rf -- "'"$tmp"'"' EXIT
@@ -621,8 +674,8 @@ case "${1:-all}" in
   -h|--help|help) usage ;;
   conda)
     shift
-    if [[ "${1:-}" == --check ]]; then shift; (($#==0)) || { usage >&2; exit 2; }; rna_darlin_check_all_env; rna_darlin_setup_calling --check
-    else rna_darlin_setup_conda "$@"; rna_darlin_setup_calling; fi ;;
+    if [[ "${1:-}" == --check ]]; then shift; (($#==0)) || { usage >&2; exit 2; }; rna_darlin_check_all_env; rna_darlin_native_quantifier check; rna_darlin_setup_calling --check
+    else rna_darlin_setup_conda "$@"; rna_darlin_setup_quantifier; rna_darlin_setup_calling; fi ;;
   atlas) shift; rna_darlin_setup_atlas "$@" ;;
   calling) shift; rna_darlin_setup_calling "$@" ;;
   reference) shift; rna_darlin_setup_reference "$@" ;;

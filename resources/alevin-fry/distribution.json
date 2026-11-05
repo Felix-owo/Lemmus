@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "tool": "alevin-fry",
+  "version": "0.18.3",
+  "gene_level_ec_order": "lexicographic_gene_labels_v1",
+  "upstream_commit": "ad05742d274230f9141b2eabeebd1c1b31692199",
+  "source_archive_url": "https://codeload.github.com/COMBINE-lab/alevin-fry/tar.gz/refs/tags/v0.18.3",
+  "source_archive_sha256": "ec36543dd23041f46ffdbe9f0207c1301f72e6c03f4e017d5cde18be626868d7",
+  "cargo_lock_sha256": "9ec3d52814155fb76c4f4d955f6a6980b537d14edaa726d20e94ffdab987474e",
+  "patch_sha256": "2e31a92ba1ddbfdc2e459a057a6978a6cb701a4be1b760c54de70ff4284cc765",
+  "platforms": {
+    "osx-arm64": {
+      "path": "osx-arm64/alevin-fry",
+      "sha256": "e999959740b442b487e482ba579a65b9b335a0a1699681366db6ce07c7c80265"
+    },
+    "linux-64": {
+      "path": "linux-64/alevin-fry",
+      "sha256": "7887f5f41bf128d9d81c99cc6f95c6f7d701d37ad94978aee62261f70a6e3d00"
+    }
+  }
+}

@@ -1,6 +1,6 @@
 # Lemmus
 
-当前版本为Git tag `v5.13`，正式发行包以包内README为准。源码计算位于`core/lemmus/`，下游实现归其`downstream/`子包，顶层`downstream/`只承载Notebook。
+当前版本为Git tag `v6.0`，正式发行包以包内README为准。源码计算位于`core/lemmus/`，下游实现归其`downstream/`子包，顶层`downstream/`只承载Notebook。
 
 Cabernet和Droplet都固定使用 **PG（parsimony-gene）＋物种对应45S竞争参考**。PG拒绝残余多gene歧义，不运行EM，也不将原始分子数取整。支持hg38（人NR_146144.1）与mm10（小鼠NR_046233.2），固定序列及来源见 [45S参考](resources/rrna/README.md)。技术feature `RRNA45S_COMPETITOR` 的计数单独保存在obs/uns；`biological.h5ad`、细胞调用及下游表达不含该feature。它不是生物学单拷贝gene；零技术计数不能证明没有rRNA污染。
 
@@ -8,7 +8,7 @@ Cabernet和Droplet都固定使用 **PG（parsimony-gene）＋物种对应45S竞�
 
 本版本采用上述策略；已有其它resolution配置需在Pipeline外明确调整，旧index须用Doctor重建，历史结果不自动重算或覆盖。
 
-Lemmus v5.13（原 RNA_DARLIN_Pipeline）是从 Camellia 拆出的独立 RNA + targeted DARLIN workflow，基于 Snakemake。它可以完成：
+Lemmus v6.0（原 RNA_DARLIN_Pipeline）是从 Camellia 拆出的独立 RNA + targeted DARLIN workflow，基于 Snakemake。它可以完成：
 
 - RNA：Cabernet 3′ 与 DD-MET5 Droplet RNA 独立调用和定量（simpleaf 单一 backend）；
 - DARLIN：targeted lineage barcode 的 streaming 提取、UMI 级等位基因共识与 directional clone denoising；
@@ -46,18 +46,18 @@ Cabernet RNA 路径按标准 TSO-based 3′ UMI scRNA-seq 处理，不再保留 
 
 ## 1. 从 GitHub 下载 Pipeline
 
-从 [v5.13 Release](https://github.com/Felix-owo/Lemmus/releases/tag/v5.13) 下载 `Lemmus-v5.13.tar.gz` 和 `SHA256SUMS`，校验后解压：
+从 [v6.0 Release](https://github.com/Felix-owo/Lemmus/releases/tag/v6.0) 下载 `Lemmus-v6.0.tar.gz` 和 `SHA256SUMS`，校验后解压：
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf Lemmus-v5.13.tar.gz
-cd Lemmus-v5.13
+tar -xzf Lemmus-v6.0.tar.gz
+cd Lemmus-v6.0
 ```
 
 也可使用正式 tag 获取代码：
 
 ```bash
-git clone --branch v5.13 --single-branch https://github.com/Felix-owo/Lemmus.git
+git clone --branch v6.0 --single-branch https://github.com/Felix-owo/Lemmus.git
 cd Lemmus
 ```
 
@@ -124,7 +124,7 @@ core/doctor.sh atlas --check  # 计算节点离线核验资源与 SHA256
 core/doctor.sh test           # 编译、配置/schema、运行自检与可用的full-DAG dry-run
 ```
 
-rules 环境至少提供：Python、simpleaf、piscem、alevin-fry、umi_tools（仅 DARLIN 使用）、FastQC、MultiQC、Java。当前生产版本策略以可从 Bioconda 一致安装为优先（simpleaf 0.28 系列、piscem 0.22.1 系列、alevin-fry 0.18 系列）；版本升级必须同时验证 index-format compatibility 和 doctor smoke。
+rules 环境至少提供：Python、simpleaf、piscem、alevin-fry、umi_tools（仅 DARLIN 使用）、FastQC、MultiQC、Java。当前生产版本策略以可从 Bioconda 一致安装为优先（simpleaf 0.28 系列、piscem 0.22.1 系列、Lemmus patched alevin-fry 0.18.3（[来源与构建](resources/alevin-fry/README.md)））；版本升级必须同时验证 index-format compatibility 和 doctor smoke。
 
 Doctor 下载 Census model 时使用 atlas 环境自己的 AWS CLI 与 Python，不依赖登录 shell 的 Python。`resources/hg38_reference/census_2025-11-08_scvi/` 保存 `model.pt`、`census_gene_map.npz`、`census_2025-11-08_scvi_reference.npz`；`census_reference.json` 最后提交，绑定采样身份与各文件 size/SHA256。准备失败不发布完成标记，原有正确 reference NPZ 不重写。
 
@@ -409,3 +409,9 @@ core/doctor.sh test
 ## DD-MET5 RNA 快速配置
 
 依次完成[初始化 Droplet 项目](#dd-met5-droplet-项目)、[检查 Droplet 配置](#dd-met5-droplet-配置)、[导入 FASTQ](#6-准备-raw-fastq-和-sample-manifest)及 dry-run，再正式运行。RNA 独立 calling 与定量完成后，按[下游关联步骤](#dnarna-文库关联)准备 DNA sealed 关联和同代 QC，运行 CLI 或专用 Notebook。
+
+## v6 原生定量与预处理
+
+Cabernet/Droplet 使用固定 gene EC 顺序的原生定量器；旧原生结果须从定量生产者重跑。升级后先在登录节点运行 `bash core/doctor.sh conda`，以新 rules generation 原子安装并保留在途作业旧环境；计算节点只读验证契约，不构建依赖。
+
+Droplet 预处理采用有界多进程与原生 Cutadapt，固定申请16 CPU／8 GiB，保持配对、序列、质量、条码/UMI、输入顺序和科学QC。其资源预算独立于定量阶段。

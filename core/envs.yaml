@@ -24,7 +24,7 @@ rules:
   - jsonschema>=4.26,<5
   - simpleaf>=0.28,<0.29
   - piscem>=0.22.1,<0.23
-  - alevin-fry>=0.18,<0.19
+  - alevin-fry=0.18.3
   - umi_tools>=1.1,<2
   - pandas>=2.2,<4
   - anndata>=0.11,<1
@@ -44,6 +44,7 @@ calling:
   dependencies:
   - python=3.12
   - cutadapt=5.2
+  - python-isal>=1.8,<2
   - curl
   - numpy>=2,<3
   - pandas>=2.2,<4

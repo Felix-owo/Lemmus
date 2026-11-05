@@ -20,7 +20,7 @@ from lemmus.config import PROTOCOLS,get_protocol
 from lemmus.inputs import droplet_whitelist_path
 from lemmus.rna import droplet_geometry
 from lemmus.rna import validate_rna_reference
-from lemmus.config import RNA_RESOLUTION as PRODUCTION_RNA_RESOLUTION
+from lemmus.config import RNA_RESOLUTION as PRODUCTION_RNA_RESOLUTION, RNA_GENE_EC_ORDER
 
 validate_config(config)
 config = select_config(config)
@@ -422,9 +422,9 @@ rule preprocess_droplet_rna:
         qc=str(DROPLET_DIR / "{sample}" / "preprocess.json")
     log:
         str(LOG_DIR / "{sample}.droplet_preprocess.log")
-    threads: 2
+    threads: 16
     resources:
-        mem_mb=1024,
+        mem_mb=8192,
         runtime=RNA_RUNTIME_MIN
     params:
         python=str(CALLING_ENV / "bin/python")
@@ -433,7 +433,7 @@ rule preprocess_droplet_rna:
         mkdir -p "$(dirname {log:q})"
         {params.python:q} -m lemmus preprocess-droplet-rna \
           --r1 {input.r1:q} --r2 {input.r2:q} \
-          --output-r1 {output.r1:q} --output-r2 {output.r2:q} --qc {output.qc:q} > {log:q} 2>&1
+          --output-r1 {output.r1:q} --output-r2 {output.r2:q} --qc {output.qc:q} --threads {threads} > {log:q} 2>&1
         """
 
 
@@ -447,6 +447,7 @@ def quant_r2(wildcards):
 
 rule simpleaf_quant:
     input:
+        native_distribution=str(PIPELINE_ROOT / "resources" / "alevin-fry" / "distribution.json"),
         r1=quant_r1,
         r2=quant_r2,
         whitelist=rules.write_rna_whitelist.output.whitelist,
@@ -476,6 +477,7 @@ rule simpleaf_quant:
         index=str(SIMPLEAF_INDEX),
         chemistry=rna_geometry(),
         resolution=RNA_RESOLUTION,
+        gene_ec_order=RNA_GENE_EC_ORDER,
         expected_ori=RNA_EXPECTED_ORI,
         min_reads=RNA_MIN_READS,
         output_dir=lambda wildcards: str(QUANT_DIR / wildcards.sample),
