@@ -17,3 +17,5 @@ Do not replace the embedded CARLIN sequences with genome FASTA. Changing these c
 ## Related documents
 
 - [Embedded implementation](../core/lemmus/darlin.py)
+- [Extraction and optional RNA rescue](https://github.com/Felix-owo/Lemmus_dev/blob/main/docs/contracts/darlin-design.md)
+- [Scientific and validation contract](https://github.com/Felix-owo/Lemmus_dev/blob/main/docs/contracts/darlin.md#5-darlin)

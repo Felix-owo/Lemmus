@@ -61,7 +61,6 @@ DEFAULT_ANALYSIS_PARAMS = {
     "gene_support_min_expected_umi": 1.0,
     "min_counts_per_cell": 1000,
     "min_cells_per_gene": 3,
-    "max_mito_pct": 10.0,
     "n_top_hvg": 2000,
     "n_pcs": 30,
     "n_neighbors": 15,
@@ -93,6 +92,9 @@ class AnalysisError(RuntimeError):
 
 
 def validate_analysis_params(params: dict) -> dict:
+    unknown = set(params or {}) - DEFAULT_ANALYSIS_PARAMS.keys()
+    if unknown:
+        raise AnalysisError(f"Unknown analysis parameters: {', '.join(sorted(unknown))}")
     merged = {**DEFAULT_ANALYSIS_PARAMS, **(params or {})}
     positive_ints = (
         "min_genes_per_cell", "min_counts_per_cell", "min_cells_per_gene",
@@ -102,12 +104,10 @@ def validate_analysis_params(params: dict) -> dict:
         value = merged[key]
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise AnalysisError(f"analysis param {key} must be a positive int, got {value!r}")
-    for key in ("max_mito_pct", "gene_support_min_expected_umi", "leiden_resolution", "umap_min_dist"):
+    for key in ("gene_support_min_expected_umi", "leiden_resolution", "umap_min_dist"):
         value = merged[key]
         if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
             raise AnalysisError(f"analysis param {key} must be a positive number, got {value!r}")
-    if merged['max_mito_pct'] > 100:
-        raise AnalysisError('analysis param max_mito_pct must not exceed 100')
     for key in ("exclude_ig_from_pca", "exclude_mt_from_pca"):
         if not isinstance(merged[key], bool):
             raise AnalysisError(f"analysis param {key} must be a bool, got {merged[key]!r}")

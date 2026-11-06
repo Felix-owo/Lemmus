@@ -37,6 +37,7 @@ from .io import (
     invalidate_qc_completion,
     clear_analysis_outputs,
     atomic_write_json,
+    downstream_source_sha256,
 )
 
 DARLIN_CLONE_TABLE = Path("03_results/DARLIN/DARLIN_clone_id/DARLIN_Clone_ID.csv")
@@ -188,8 +189,10 @@ def publish_rna_qc_table(
 
 
 def _qc_snapshot_id(project_dir: Path) -> str:
-    """Stable id binding the downstream table to the project inputs it was built from."""
+    """Bind QC to its inputs and executed scientific logic before reusing parameters."""
     digest = hashlib.sha256()
+    digest.update(downstream_source_sha256().encode("ascii"))
+    digest.update(b"\0")
     import yaml
     cfg = yaml.safe_load((project_dir / '00_config/config.yaml').read_text())
     files = ['00_config/config.yaml', '00_config/sample_manifest.tsv']
@@ -244,7 +247,7 @@ def run_processor(project_dir: Path, output_root: Path | None = None, *,
     with write_lock(out_dir):
         qc_path = out_dir / 'RNA_QC_Information.csv'
         is_droplet = 'protocol' in rna and rna['protocol'].eq('droplet').all()
-        qc_keys = {'min_genes_per_cell', 'min_counts_per_cell', 'max_mito_pct'}
+        qc_keys = {'min_genes_per_cell', 'min_counts_per_cell'}
         if params and (not is_droplet or set(params) - qc_keys):
             raise DownstreamQCError('QC-only overrides require Droplet and cell QC thresholds; use --analyze for analysis parameters')
         metrics_path = out_dir/'RNA_cell_qc_metrics.csv'
@@ -376,7 +379,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-genes-per-cell", type=int, default=None)
     parser.add_argument("--min-counts-per-cell", type=int, default=None)
     parser.add_argument("--min-cells-per-gene", type=int, default=None)
-    parser.add_argument("--max-mito-pct", type=float, default=None)
     parser.add_argument("--n-top-hvg", type=int, default=None)
     parser.add_argument("--n-pcs", type=int, default=None)
     parser.add_argument("--n-neighbors", type=int, default=None)
@@ -396,7 +398,7 @@ def main(argv: list[str] | None = None) -> int:
                 key: getattr(args, key)
                 for key in (
                     "min_genes_per_cell", "min_counts_per_cell", "min_cells_per_gene",
-                    "max_mito_pct", "n_top_hvg", "n_pcs", "n_neighbors",
+                    "n_top_hvg", "n_pcs", "n_neighbors",
                     "leiden_resolution", "umap_min_dist", "random_state",
                 )
             }
@@ -418,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
             if any(getattr(args, key) is not None for key in analysis_only) or args.keep_ig_in_pca or args.keep_mt_in_pca or args.enable_immune_optional:
                 raise DownstreamQCError('Analysis parameters require --analyze')
             qc_params = {key: getattr(args, key) for key in
-                         ('min_genes_per_cell', 'min_counts_per_cell', 'max_mito_pct')
+                         ('min_genes_per_cell', 'min_counts_per_cell')
                          if getattr(args, key) is not None}
             run_processor(args.project_dir, args.output_root, dna_project_root=args.dna_project_root,
                           params=qc_params or None)
@@ -542,13 +544,12 @@ def compute_rna_qc(adata, params: dict) -> None:
 
 
 def cell_qc_mask(obs, params: dict):
-    """Pure-pandas cell filter so the threshold contract stays unit-testable."""
+    """Filter by supported genes and UMI counts; MT% remains diagnostic only."""
     import pandas as pd
 
     return (
         (obs["n_genes_supported"] >= params["min_genes_per_cell"])
         & (obs["total_counts"] >= params["min_counts_per_cell"])
-        & (obs["pct_counts_mt"] < params["max_mito_pct"])
     ) if isinstance(obs, pd.DataFrame) else None
 
 
