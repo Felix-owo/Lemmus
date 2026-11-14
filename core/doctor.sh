@@ -34,22 +34,46 @@ TXT
 # 构建事务只序列化会写共享状态的环境/reference 提交，不参与普通 Pipeline 运行。
 rna_darlin_transaction_lock() {
   local name="$1" lock="$RNA_DARLIN_CONDA_ROOT/.locks/$1.lock"
-  mkdir -p "$(dirname "$lock")"
+  mkdir -p "$(dirname "$lock")" || return $?
   if ! mkdir "$lock" 2>/dev/null; then
     echo "ERROR: $name 构建事务正在进行: $lock" >&2
     return 75
   fi
-  printf '%s\n' "$$" > "$lock/pid"
+  local status owner_host
+  if owner_host="$(hostname)" && printf '%s\t%s\n' "$owner_host" "$$" > "$lock/owner.tsv"; then :
+  else
+    status=$?
+    # owner未完整写入时不能进入构建；只回收本次创建的owner和空锁目录。
+    rm -f -- "$lock/owner.tsv" && rmdir -- "$lock" || echo "WARNING: failed to remove unowned transaction lock: $lock" >&2
+    return "$status"
+  fi
   RNA_DARLIN_ACTIVE_LOCK="$lock"
   RNA_DARLIN_TRANSACTION_KIND="$name"
-  trap 'if [[ -n "${RNA_DARLIN_ACTIVE_CANDIDATE:-}" ]]; then if [[ "${RNA_DARLIN_TRANSACTION_KIND:-}" == reference ]]; then echo "保留失败 reference 候选供诊断/恢复: $RNA_DARLIN_ACTIVE_CANDIDATE" >&2; else rm -rf -- "$RNA_DARLIN_ACTIVE_CANDIDATE"; fi; fi; [[ -n "${RNA_DARLIN_ACTIVE_LOCK:-}" ]] && rm -rf -- "$RNA_DARLIN_ACTIVE_LOCK"' EXIT
+  trap 's=$?; if [[ -n "${RNA_DARLIN_ACTIVE_CANDIDATE:-}" ]]; then if [[ "${RNA_DARLIN_TRANSACTION_KIND:-}" == reference ]]; then echo "保留失败 reference 候选供诊断/恢复: $RNA_DARLIN_ACTIVE_CANDIDATE" >&2; else rm -rf -- "$RNA_DARLIN_ACTIVE_CANDIDATE"; fi; fi; rna_darlin_release_transaction_lock || true; exit "$s"' EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
 }
 
 rna_darlin_release_transaction_lock() {
   [[ -n "${RNA_DARLIN_ACTIVE_LOCK:-}" ]] || return 0
-  rm -rf -- "$RNA_DARLIN_ACTIVE_LOCK"
+  local lock="$RNA_DARLIN_ACTIVE_LOCK" status owner_host owner_pid owner_record
+  # 核对本机 owner；不递归删除，未知成员或路径替换必须留给诊断。
+  if (
+    [[ ! -L "$lock" ]] && cd "$lock" || exit 1
+    [[ "$lock" -ef . && -f owner.tsv && ! -L owner.tsv ]] || exit 1
+    owner_record="$(cat owner.tsv)" || exit $?
+    IFS=$'\t' read -r owner_host owner_pid < owner.tsv || exit $?
+    [[ "$owner_pid" == "$$" && "$owner_host" == "$(hostname)" ]] || exit 1
+    rm -f -- owner.tsv || exit $?
+    if rmdir -- "$lock"; then exit 0; else status=$?; fi
+    (set -C; printf '%s\n' "$owner_record" > owner.tsv) || \
+      echo "WARNING: failed to restore transaction owner: $lock" >&2
+    exit "$status"
+  ); then :; else
+    status=$?
+    echo "WARNING: refusing or unable to release transaction lock: $lock" >&2
+    return "$status"
+  fi
   RNA_DARLIN_ACTIVE_LOCK=""
   trap - EXIT INT TERM
 }
@@ -115,8 +139,11 @@ rna_darlin_native_quantifier() {
 
 # 原生工件按 SHA256 独立安装；不克隆或改写已有 Conda 环境。
 rna_darlin_setup_quantifier() (
-  rna_darlin_native_quantifier check >/dev/null 2>&1 && return 0
-  rna_darlin_require_login_for_conda || return $?
+  if [[ "$(uname -s)" == Linux && -n "${SLURM_JOB_ID:-}" ]]; then
+    rna_darlin_native_quantifier check >/dev/null 2>&1 && return 0
+    rna_darlin_require_login_for_conda
+    return $?
+  fi
   rna_darlin_transaction_lock native_quantifier || return $?
   rna_darlin_native_quantifier prepare || return $?
   rna_darlin_native_quantifier check || return $?
@@ -128,7 +155,7 @@ rna_darlin_setup_calling() {
   local conda_bin="${RNA_DARLIN_CONTROL_ENV}/bin/conda"
   if [[ "${1:-}" == --check ]]; then
     (($#==1)) || { usage >&2; return 2; }
-    rna_darlin_check_calling_env
+    rna_darlin_check_calling_env || return $?
     "$RNA_DARLIN_RULE_ENV/bin/python" -c 'from lemmus.inputs import load_droplet_whitelist,droplet_whitelist_path; load_droplet_whitelist(droplet_whitelist_path())'
     return
   fi
@@ -137,31 +164,31 @@ rna_darlin_setup_calling() {
     if [[ "$(uname -s)" == Linux && -n "${SLURM_JOB_ID:-}" ]]; then
       rna_darlin_setup_calling --check
     else
-      "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus prepare-droplet-whitelist
+      "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus prepare-droplet-whitelist || return $?
     fi
     return
   fi
-  rna_darlin_require_login_for_conda
+  rna_darlin_require_login_for_conda || return $?
   [[ -x "$conda_bin" ]] || { echo "ERROR: control Conda is required" >&2; return 127; }
-  rna_darlin_transaction_lock calling
+  rna_darlin_transaction_lock calling || return $?
   local candidate spec
   candidate="$RNA_DARLIN_CONDA_ROOT/environments/calling-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   RNA_DARLIN_ACTIVE_CANDIDATE="$candidate"
-  mkdir -p "$candidate" "$RNA_DARLIN_CONDA_ROOT/package-cache"
+  mkdir -p "$candidate" "$RNA_DARLIN_CONDA_ROOT/package-cache" || return $?
   spec="$candidate/spec.yaml"
-  rna_darlin_extract_env_role calling "$spec"
+  rna_darlin_extract_env_role calling "$spec" || return $?
   if [[ "$(uname -s)" == Linux ]]; then
-    printf '%s\n' '- bioconductor-dropletutils=1.30.0' >> "$spec"
+    printf '%s\n' '- bioconductor-dropletutils=1.30.0' >> "$spec" || return $?
   fi
   CONDA_ALWAYS_COPY=true CONDA_PKGS_DIRS="$RNA_DARLIN_CONDA_ROOT/package-cache" "$conda_bin" env create \
-    --solver libmamba --prefix "$candidate/env" --file "$spec"
+    --solver libmamba --prefix "$candidate/env" --file "$spec" || return $?
   "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus prepare-calling \
-    --prefix "$candidate/env" --conda "$conda_bin"
-  "$candidate/env/bin/Rscript" --vanilla -e 'stopifnot(getRversion() >= "4.5", getRversion() < "4.6", packageVersion("DropletUtils") == "1.30.0")'
-  "$candidate/env/bin/cutadapt" --version
-  "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus prepare-droplet-whitelist
+    --prefix "$candidate/env" --conda "$conda_bin" || return $?
+  "$candidate/env/bin/Rscript" --vanilla -e 'stopifnot(getRversion() >= "4.5", getRversion() < "4.6", packageVersion("DropletUtils") == "1.30.0")' || return $?
+  "$candidate/env/bin/cutadapt" --version || return $?
+  "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus prepare-droplet-whitelist || return $?
   "$RNA_DARLIN_RULE_ENV/bin/python" -c 'import os,sys; p=sys.argv[1]; t=p+".tmp."+str(os.getpid()); os.symlink(sys.argv[2],t); os.replace(t,p)' \
-    "$RNA_DARLIN_CALLING_ENV" "$candidate/env"
+    "$RNA_DARLIN_CALLING_ENV" "$candidate/env" || return $?
   RNA_DARLIN_ACTIVE_CANDIDATE=""
   rna_darlin_release_transaction_lock
 }
@@ -173,7 +200,7 @@ rna_darlin_extract_env_role() {
     $0 == role ":" {inside=1; next}
     inside && /^[^[:space:]][^:]*:/ {exit}
     inside {sub(/^  /, ""); print}
-  ' "$RNA_DARLIN_PIPELINE_ROOT/core/envs.yaml" > "$output"
+  ' "$RNA_DARLIN_PIPELINE_ROOT/core/envs.yaml" > "$output" || return $?
   [[ -s "$output" ]] || { echo "ERROR: envs.yaml 缺少角色: $role" >&2; return 2; }
 }
 
@@ -183,24 +210,24 @@ rna_darlin_rna_toolchain_smoke() {
   local ALEVIN_FRY_HOME="$rules_env/.simpleaf_home"
   local PATH="$rules_env/bin:$rules_env/lib/jvm/bin:$PATH"
   export ALEVIN_FRY_HOME PATH
-  "$rules_env/bin/simpleaf" --version >/dev/null
-  "$rules_env/bin/piscem" --version >/dev/null
-  "$rules_env/bin/alevin-fry" --version >/dev/null
-  "$rules_env/bin/umi_tools" --version >/dev/null
-  "$rules_env/bin/fastqc" --version >/dev/null
-  "$rules_env/bin/multiqc" --version >/dev/null
+  "$rules_env/bin/simpleaf" --version >/dev/null || return $?
+  "$rules_env/bin/piscem" --version >/dev/null || return $?
+  "$rules_env/bin/alevin-fry" --version >/dev/null || return $?
+  "$rules_env/bin/umi_tools" --version >/dev/null || return $?
+  "$rules_env/bin/fastqc" --version >/dev/null || return $?
+  "$rules_env/bin/multiqc" --version >/dev/null || return $?
 }
 
 # Pipeline 使用显式 custom geometry 和项目 whitelist；固定空 registry，避免 simpleaf 隐式联网。
 rna_darlin_prepare_simpleaf_home() {
-  local home="$1" rules_env="$2" registry temporary native
+  local simpleaf_home="$1" rules_env="$2" registry native
   native="$(rna_darlin_native_quantifier path)" || return $?
-  registry="$home/chemistries.json"
-  temporary="$home/.chemistries.json.tmp.$$"
-  mkdir -p "$home"
-  printf '{}\n' > "$temporary"
-  mv "$temporary" "$registry"
-  ALEVIN_FRY_HOME="$home" PATH="$rules_env/bin:$PATH" "$rules_env/bin/simpleaf" set-paths \
+  rules_env="$(cd "$rules_env" && pwd -P)" || return $?
+  registry="$simpleaf_home/chemistries.json"
+  mkdir -p "$simpleaf_home" || return $?
+  # 调用方提供独占临时目录；拒绝覆盖可能仍被在途作业读取的 registry。
+  (set -C; printf '{}\n' > "$registry") || return $?
+  ALEVIN_FRY_HOME="$simpleaf_home" PATH="$rules_env/bin:$PATH" "$rules_env/bin/simpleaf" set-paths \
     --piscem "$rules_env/bin/piscem" \
     --alevin-fry "$native" >/dev/null
 }
@@ -262,39 +289,39 @@ rna_darlin_setup_conda() (
     echo "受管环境可用；使用 --update 可原子重建。"
     return 0
   fi
-  rna_darlin_require_login_for_conda
+  rna_darlin_require_login_for_conda || return $?
   [[ -n "$conda_bin" ]] || conda_bin="$(command -v conda 2>/dev/null || true)"
   [[ -n "$conda_bin" && -x "$conda_bin" ]] || { echo "ERROR: modern Conda not found; pass --conda PATH." >&2; return 127; }
   local version major
-  version="$($conda_bin --version | awk '{print $2}')"; major="${version%%.*}"
+  version="$("$conda_bin" --version | awk '{print $2}')" || return $?; major="${version%%.*}"
   [[ "$major" == 26 ]] || { echo "ERROR: Conda >=26,<27 required; found $version" >&2; return 2; }
 
-  rna_darlin_transaction_lock environments
+  rna_darlin_transaction_lock environments || return $?
   local generation env_root setup control rules atlas current_tmp
   generation="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   env_root="$RNA_DARLIN_CONDA_ROOT/environments/$generation"
   control="$env_root/control"; rules="$env_root/rules"; atlas="$env_root/atlas"; setup="$env_root/setup"
-  mkdir -p "$setup" "$RNA_DARLIN_CONDA_ROOT/package-cache"
-  trap 's=$?; if ((s!=0)); then chmod -R u+w "'"$env_root"'" 2>/dev/null || true; rm -rf -- "'"$env_root"'"; fi; [[ -n "${RNA_DARLIN_ACTIVE_LOCK:-}" ]] && rm -rf -- "$RNA_DARLIN_ACTIVE_LOCK"; exit $s' EXIT
-  rna_darlin_extract_env_role control "$setup/control.yaml"
-  rna_darlin_extract_env_role rules "$setup/rules.yaml"
-  rna_darlin_extract_env_role atlas "$setup/atlas.yaml"
+  mkdir -p "$setup" "$RNA_DARLIN_CONDA_ROOT/package-cache" || return $?
+  trap 's=$?; if ((s!=0)); then chmod -R u+w "'"$env_root"'" 2>/dev/null || true; rm -rf -- "'"$env_root"'"; fi; rna_darlin_release_transaction_lock || true; exit "$s"' EXIT
+  rna_darlin_extract_env_role control "$setup/control.yaml" || return $?
+  rna_darlin_extract_env_role rules "$setup/rules.yaml" || return $?
+  rna_darlin_extract_env_role atlas "$setup/atlas.yaml" || return $?
   unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_EXE CONDA_PYTHON_EXE CONDA_SHLVL PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONUSERBASE VIRTUAL_ENV
   export CONDA_PKGS_DIRS="$RNA_DARLIN_CONDA_ROOT/package-cache" PYTHONNOUSERSITE=1
-  "$conda_bin" env create --solver libmamba --prefix "$control" --file "$setup/control.yaml"
-  "$conda_bin" env create --solver libmamba --prefix "$rules" --file "$setup/rules.yaml"
-  "$conda_bin" env create --solver libmamba --prefix "$atlas" --file "$setup/atlas.yaml"
-  "$control/bin/python" -c 'import jsonschema, yaml'
-  "$rules/bin/python" -c 'import anndata, hdf5plugin, numpy, pandas, pysam, yaml'
-  "$atlas/bin/python" -c 'import anndata, cellxgene_census, igraph, leidenalg, scanpy, scvi, sklearn, skimage, hdf5plugin, snapatac2; from ALLCools.clustering.doublets import MethylScrublet'
+  "$conda_bin" env create --solver libmamba --prefix "$control" --file "$setup/control.yaml" || return $?
+  "$conda_bin" env create --solver libmamba --prefix "$rules" --file "$setup/rules.yaml" || return $?
+  "$conda_bin" env create --solver libmamba --prefix "$atlas" --file "$setup/atlas.yaml" || return $?
+  "$control/bin/python" -c 'import jsonschema, yaml' || return $?
+  "$rules/bin/python" -c 'import anndata, hdf5plugin, numpy, pandas, pysam, yaml' || return $?
+  "$atlas/bin/python" -c 'import anndata, cellxgene_census, igraph, leidenalg, scanpy, scvi, sklearn, skimage, hdf5plugin, snapatac2; from ALLCools.clustering.doublets import MethylScrublet' || return $?
   local exe
   for exe in "${RNA_DARLIN_RULE_EXECUTABLES[@]}"; do [[ -x "$rules/$exe" ]] || { echo "ERROR: candidate missing $exe" >&2; return 1; }; done
-  PATH="$rules/bin:$rules/lib/jvm/bin:$PATH" "$rules/bin/fastqc" --version >/dev/null
-  PATH="$rules/bin:$rules/lib/jvm/bin:$PATH" "$rules/bin/multiqc" --version >/dev/null
-  PYTHONPATH="$RNA_DARLIN_PIPELINE_ROOT/core" "$control/bin/python" -m lemmus native-quantifier prepare
-  rna_darlin_rna_toolchain_smoke "$rules"
-  rm -rf -- "$setup"
-  "$control/bin/python" - "$RNA_DARLIN_CONDA_ROOT/current" "environments/$generation" <<'PY'
+  PATH="$rules/bin:$rules/lib/jvm/bin:$PATH" "$rules/bin/fastqc" --version >/dev/null || return $?
+  PATH="$rules/bin:$rules/lib/jvm/bin:$PATH" "$rules/bin/multiqc" --version >/dev/null || return $?
+  PYTHONPATH="$RNA_DARLIN_PIPELINE_ROOT/core" "$control/bin/python" -m lemmus native-quantifier prepare || return $?
+  rna_darlin_rna_toolchain_smoke "$rules" || return $?
+  rm -rf -- "$setup" || return $?
+  "$control/bin/python" - "$RNA_DARLIN_CONDA_ROOT/current" "environments/$generation" <<'PY' || return $?
 import os, sys
 from pathlib import Path
 active=Path(sys.argv[1]); target=sys.argv[2]
@@ -304,7 +331,7 @@ os.symlink(target, temporary)
 os.replace(temporary, active)
 PY
   trap - EXIT
-  rna_darlin_release_transaction_lock
+  rna_darlin_release_transaction_lock || return $?
   echo "Activated environment generation: $generation"
 )
 
@@ -346,52 +373,52 @@ rna_darlin_setup_atlas() {
   [[ "${1:-}" == --check ]] && { check=1; shift; }
   (($#==0)) || { usage >&2; return 2; }
   rna_darlin_check_atlas_env || { echo "ERROR: atlas environment incomplete; run doctor.sh conda" >&2; return 127; }
-  if (( check )); then rna_darlin_setup_ontology check; rna_darlin_check_atlas_assets; return; fi
+  if (( check )); then rna_darlin_setup_ontology check || return $?; rna_darlin_check_atlas_assets; return; fi
   rna_darlin_prepare_atlas_assets
 }
 
 # 完整 Doctor 已核验环境；资产准备不重复导入整套 atlas 科学依赖。
 rna_darlin_prepare_atlas_assets() {
   if [[ "$(uname -s)" == Linux && -n "${SLURM_JOB_ID:-}" ]]; then
-    rna_darlin_setup_ontology check
+    rna_darlin_setup_ontology check || return $?
     rna_darlin_check_atlas_assets
     return
   fi
-  rna_darlin_transaction_lock atlas
-  rna_darlin_setup_ontology
-  if [[ ! -s "$RNA_DARLIN_ATLAS_MODEL" || "$(wc -c < "$RNA_DARLIN_ATLAS_MODEL" | tr -d ' ')" != "$RNA_DARLIN_ATLAS_MODEL_SIZE" ]]; then
-    mkdir -p "$(dirname "$RNA_DARLIN_ATLAS_MODEL")"
-    local tmp
-    tmp="$(mktemp "$RNA_DARLIN_ATLAS_MODEL.part.XXXXXXXX")"
-    RNA_DARLIN_ACTIVE_CANDIDATE="$tmp"
-    PATH="$RNA_DARLIN_ATLAS_ENV/bin:$PATH" "$RNA_DARLIN_ATLAS_ENV/bin/aws" s3 cp --no-sign-request --no-progress --only-show-errors \
-      s3://cellxgene-contrib-public/models/scvi/2025-11-08/homo_sapiens/model.pt "$tmp"
-    [[ "$(wc -c < "$tmp" | tr -d ' ')" == "$RNA_DARLIN_ATLAS_MODEL_SIZE" ]] || { rm -f -- "$tmp"; echo "ERROR: downloaded model size mismatch" >&2; return 1; }
-    rm -f -- "$(dirname "$RNA_DARLIN_ATLAS_MODEL")/census_reference.json"
-    mv "$tmp" "$RNA_DARLIN_ATLAS_MODEL"
-    RNA_DARLIN_ACTIVE_CANDIDATE=""
-  fi
-  "$RNA_DARLIN_ATLAS_ENV/bin/python" -m lemmus census-reference prepare
-  rna_darlin_check_atlas_assets
+  rna_darlin_transaction_lock atlas || return $?
+  rna_darlin_setup_ontology || return $?
+  PATH="$RNA_DARLIN_ATLAS_ENV/bin:$PATH" "$RNA_DARLIN_ATLAS_ENV/bin/python" -m lemmus census-reference prepare || return $?
+  rna_darlin_check_atlas_assets || return $?
   rna_darlin_release_transaction_lock
 }
 
-# 固定视图只提交已验证候选；旧目录保留，提交失败立即恢复，不递归删除共享参考。
+rna_darlin_reference_rename() {
+  "$RNA_DARLIN_RULE_ENV/bin/python" -c '
+import os
+import sys
+
+source, target = sys.argv[1:]
+if os.path.lexists(target):
+    raise FileExistsError(f"Reference destination already exists: {target}")
+os.rename(source, target)
+' "$1" "$2"
+}
+
+# 固定视图只提交已验证候选；提交失败时只恢复到空闲的目标路径。
 rna_darlin_publish_reference() {
   local candidate="$1" target="$2" previous="" status
   # mktemp 候选在构建期间私有；发布时恢复当前 umask 的目录权限。
-  if [[ ! -L "$candidate" ]]; then chmod "$(umask -S)" "$candidate"; fi
+  if [[ ! -L "$candidate" ]]; then chmod "$(umask -S)" "$candidate" || return $?; fi
   if [[ -e "$target" || -L "$target" ]]; then
-    previous="$(mktemp -d "${target}.previous.XXXXXXXX")"
-    rmdir "$previous"
-    mv -- "$target" "$previous"
+    previous="$(mktemp -d "${target}.previous.XXXXXXXX")" || return $?
+    rmdir "$previous" || return $?
+    rna_darlin_reference_rename "$target" "$previous" || return $?
   fi
-  if mv -- "$candidate" "$target"; then
+  if rna_darlin_reference_rename "$candidate" "$target"; then
     [[ -z "$previous" ]] || echo "保留原 reference: $previous"
   else
     status=$?
     if [[ -n "$previous" ]]; then
-      mv -- "$previous" "$target" || echo "ERROR: reference 回滚失败；保留于 $previous" >&2
+      rna_darlin_reference_rename "$previous" "$target" || echo "ERROR: reference 回滚失败；保留于 $previous" >&2
     fi
     return "$status"
   fi
@@ -417,7 +444,6 @@ rna_darlin_setup_reference() {
   [[ "$mode" != link || -n "$source_dir" ]] || { echo "ERROR: --link requires --source" >&2; return 2; }
   local resource_root target candidate required
   resource_root="$RNA_DARLIN_PIPELINE_ROOT/resources"
-  mkdir -p "$resource_root/${species}_reference"
   # 新科学参考独占视图；父目录中的既有参考与Census/ontology不参与替换。
   target="$resource_root/${species}_reference/pg45s"
   if [[ -e "$target" ]]; then
@@ -427,49 +453,57 @@ rna_darlin_setup_reference() {
     if (( complete )) && "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus rna-reference check --species "$species" --path "$target" >/dev/null 2>&1; then
       echo "RNA PG+45S reference already ready: $target"; return 0
     fi
-    [[ ! -L "$target" && -d "$target" ]] || { echo "ERROR: incomplete reference target is not a directory: $target" >&2; return 2; }
   fi
+  if [[ "$(uname -s)" == Linux && -n "${SLURM_JOB_ID:-}" ]]; then
+    echo "ERROR: $species PG+45S reference is missing or invalid. 在登录节点运行 bash core/doctor.sh reference $species" >&2
+    return 2
+  fi
+  if [[ -e "$target" && ( -L "$target" || ! -d "$target" ) ]]; then
+    echo "ERROR: incomplete reference target is not a directory: $target" >&2
+    return 2
+  fi
+  mkdir -p "$resource_root/${species}_reference" || return $?
   if [[ -z "$source_dir" && -z "$fasta" && -z "$gtf" ]]; then
     fasta="$RNA_DARLIN_PIPELINE_ROOT/resources/reference_source/${species}.fa"
     gtf="$RNA_DARLIN_PIPELINE_ROOT/resources/reference_source/${species}.genes.gtf"
   fi
-  rna_darlin_transaction_lock reference
+  rna_darlin_transaction_lock reference || return $?
   if [[ -n "$source_dir" ]]; then
-    source_dir="$(cd "$source_dir" && pwd -P)"
+    source_dir="$(cd "$source_dir" && pwd -P)" || return $?
     for required in genome.fa genes/genes.gtf simpleaf/ref/t2g.tsv simpleaf/index/gene_id_to_name.tsv; do [[ -s "$source_dir/$required" ]] || { echo "ERROR: source reference lacks $required" >&2; return 1; }; done
     compgen -G "$source_dir/simpleaf/index/piscem_idx*" >/dev/null || { echo "ERROR: source reference lacks piscem index" >&2; return 1; }
-    "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus rna-reference check --species "$species" --path "$source_dir"
-    candidate="$(mktemp -d "$resource_root/${species}_reference.building.XXXXXXXX")"
+    "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus rna-reference check --species "$species" --path "$source_dir" || return $?
+    candidate="$(mktemp -d "$resource_root/${species}_reference.building.XXXXXXXX")" || return $?
     RNA_DARLIN_ACTIVE_CANDIDATE="$candidate"
-    if [[ "$mode" == link ]]; then rmdir "$candidate"; ln -s "$source_dir" "$candidate"
-    else cp -R "$source_dir/." "$candidate/"; fi
-    "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus rna-reference check --species "$species" --path "$candidate"
-    rna_darlin_publish_reference "$candidate" "$target"
+    if [[ "$mode" == link ]]; then rmdir "$candidate" || return $?; ln -s "$source_dir" "$candidate" || return $?
+    else cp -R "$source_dir/." "$candidate/" || return $?; fi
+    "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus rna-reference check --species "$species" --path "$candidate" || return $?
+    rna_darlin_publish_reference "$candidate" "$target" || return $?
   else
     [[ -n "$fasta" && -n "$gtf" && -s "$fasta" && -s "$gtf" ]] || { echo "ERROR: --fasta and --gtf are required and must be non-empty" >&2; return 2; }
     [[ -x "$RNA_DARLIN_RULE_ENV/bin/simpleaf" ]] || { echo "ERROR: rules environment missing; run doctor.sh conda" >&2; return 127; }
-    candidate="$(mktemp -d "$resource_root/${species}_reference.building.XXXXXXXX")"
+    candidate="$(mktemp -d "$resource_root/${species}_reference.building.XXXXXXXX")" || return $?
     RNA_DARLIN_ACTIVE_CANDIDATE="$candidate"
-    mkdir -p "$candidate/genes"
-    cp "$fasta" "$candidate/genome.fa"; cp "$gtf" "$candidate/genes/genes.gtf"
+    mkdir -p "$candidate/genes" || return $?
+    cp "$fasta" "$candidate/genome.fa" || return $?; cp "$gtf" "$candidate/genes/genes.gtf" || return $?
     "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus rna-reference prepare \
-      --species "$species" --path "$candidate/rrna_competitor.fa"
-    export ALEVIN_FRY_HOME="$RNA_DARLIN_CONDA_ROOT/simpleaf_home"
-    rna_darlin_prepare_simpleaf_home "$ALEVIN_FRY_HOME" "$RNA_DARLIN_RULE_ENV"
-    mkdir -p "$candidate/.simpleaf_work" "$candidate/.simpleaf_tmp"
+      --species "$species" --path "$candidate/rrna_competitor.fa" || return $?
+    export ALEVIN_FRY_HOME="$candidate/.simpleaf_home"
+    rna_darlin_prepare_simpleaf_home "$ALEVIN_FRY_HOME" "$RNA_DARLIN_RULE_ENV" || return $?
+    mkdir -p "$candidate/.simpleaf_work" "$candidate/.simpleaf_tmp" || return $?
     ulimit -n 2048 || true
     PATH="$RNA_DARLIN_RULE_ENV/bin:$PATH" "$RNA_DARLIN_RULE_ENV/bin/simpleaf" index \
       --output "$candidate/simpleaf" --fasta "$candidate/genome.fa" --gtf "$candidate/genes/genes.gtf" \
       --unspliced "$candidate/rrna_competitor.fa" \
-      --threads 4 --work-dir "$candidate/.simpleaf_work" --tmp-dir "$candidate/.simpleaf_tmp"
-    rna_darlin_write_two_column_t2g "$candidate/simpleaf/ref/t2g_3col.tsv" "$candidate/simpleaf/ref/t2g.tsv"
+      --threads 4 --work-dir "$candidate/.simpleaf_work" --tmp-dir "$candidate/.simpleaf_tmp" || return $?
+    rna_darlin_write_two_column_t2g "$candidate/simpleaf/ref/t2g_3col.tsv" "$candidate/simpleaf/ref/t2g.tsv" || return $?
     [[ -s "$candidate/simpleaf/ref/t2g.tsv" ]] || { echo "ERROR: simpleaf reference build incomplete: t2g.tsv" >&2; return 1; }
     compgen -G "$candidate/simpleaf/index/piscem_idx*" >/dev/null || { echo "ERROR: simpleaf reference build incomplete: piscem index" >&2; return 1; }
-    "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus rna-reference seal --species "$species" --path "$candidate"
-    rm -rf "$candidate/.simpleaf_work" "$candidate/.simpleaf_tmp"
-    rna_darlin_publish_reference "$candidate" "$target"
+    "$RNA_DARLIN_RULE_ENV/bin/python" -m lemmus rna-reference seal --species "$species" --path "$candidate" || return $?
+    rm -rf "$candidate/.simpleaf_work" "$candidate/.simpleaf_tmp" "$candidate/.simpleaf_home" || return $?
+    rna_darlin_publish_reference "$candidate" "$target" || return $?
   fi
-  RNA_DARLIN_ACTIVE_CANDIDATE=""; rna_darlin_release_transaction_lock
+  RNA_DARLIN_ACTIVE_CANDIDATE=""; rna_darlin_release_transaction_lock || return $?
   echo "RNA simpleaf/piscem reference ready: $target"
 }
 

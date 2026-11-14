@@ -1,18 +1,19 @@
 """Lemmus：read-fate 证据与磁盘守恒索引。"""
 from __future__ import annotations
-from .io import project_temporary_parent, atomic_output
+from .io import project_temporary_parent, atomic_output, validate_file_outputs
 
 import argparse
 import csv
 import gzip
 import json
+import os
 import sqlite3
 import tempfile
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import groupby, islice, zip_longest
 from pathlib import Path
-from .io import (sha256_file)
+from .io import sha256_file, is_valid_fastq_quality
 
 
 class ReadFateError(ValueError):
@@ -43,9 +44,10 @@ _INSERT_BATCH_SIZE = 8192
 _INSERT_SQL = 'INSERT INTO fates VALUES (?, ?, ?, ?, ?, ?)'
 
 
-def _validate_row(sample_id: str, modality: str, fate: str) -> None:
+def _validate_row(sample_id: str, modality: str, fate: str, read_id: str) -> None:
     _validate_sample_and_modality(sample_id, modality)
     _validate_fate(modality, fate)
+    _canonical_read_id(read_id)
 
 
 class SqliteFateStore:
@@ -70,7 +72,7 @@ class SqliteFateStore:
         self.connection.close()
 
     def insert(self, row: FateRow) -> None:
-        _validate_row(row.key.sample_id, row.key.modality, row.fate)
+        _validate_row(row.key.sample_id, row.key.modality, row.fate, row.key.read_id)
         try:
             self.connection.execute(_INSERT_SQL, self._row_values(row))
         except sqlite3.IntegrityError as exc:
@@ -87,7 +89,7 @@ class SqliteFateStore:
     def _validated_row_values(cls, rows: Sequence[FateRow]) -> Iterator[tuple[str, str, str, str, str, str]]:
         """Yield one validated parameter tuple at a time in source order."""
         for row in rows:
-            _validate_row(row.key.sample_id, row.key.modality, row.fate)
+            _validate_row(row.key.sample_id, row.key.modality, row.fate, row.key.read_id)
             yield cls._row_values(row)
 
     def _insert_batch(self, rows: Sequence[FateRow]) -> None:
@@ -134,7 +136,7 @@ class SqliteFateStore:
             if previous.fate == replacement.fate:
                 raise ReadFateError(f'Duplicate fate evidence for {key}: {replacement.fate}')
             raise ReadFateError(f'Conflicting fates for {key}: {previous.fate} vs {replacement.fate}')
-        _validate_row(key.sample_id, key.modality, replacement.fate)
+        _validate_row(key.sample_id, key.modality, replacement.fate, key.read_id)
         self.connection.execute('\n            UPDATE fates SET fate = ?, source = ?, detail = ?\n            WHERE sample_id = ? AND modality = ? AND read_id = ?\n            ', (replacement.fate, replacement.source, replacement.detail, key.sample_id, key.modality, key.read_id))
 
     def rows(self) -> Iterator[FateRow]:
@@ -173,12 +175,22 @@ def normalize_read_id(value: str | bytes) -> str:
     normalized = value.strip()
     if normalized.startswith('@'):
         normalized = normalized[1:]
-    normalized = normalized.split(None, 1)[0]
+        if normalized[:1].isspace():
+            raise ReadFateError('Read identifier is empty before header comment')
+    fields = normalized.split(None, 1)
+    normalized = fields[0] if fields else ''
     if normalized.endswith(('/1', '/2')):
         normalized = normalized[:-2]
     if not normalized:
         raise ReadFateError('Read identifier is empty after normalization')
     return normalized
+
+
+def _canonical_read_id(value: str) -> str:
+    """持久ID已由raw header生成，不能再次剥离@或/1、/2。"""
+    if not value or any(character.isspace() for character in value):
+        raise ReadFateError(f'Canonical read identifier must be nonempty and contain no whitespace: {value!r}')
+    return value
 
 
 def _validate_sample_and_modality(sample_id: str, modality: str) -> None:
@@ -218,9 +230,13 @@ def _fastq_records(path: Path) -> Iterator[tuple[str, bytes]]:
                 raise ReadFateError(f'Truncated FASTQ record {record_number} in {path}')
             if not header.startswith(b'@') or not plus.startswith(b'+'):
                 raise ReadFateError(f'Malformed FASTQ record {record_number} in {path}')
-            if len(sequence.rstrip(b'\r\n')) != len(quality.rstrip(b'\r\n')):
+            sequence_body = sequence.removesuffix(b'\n').removesuffix(b'\r')
+            quality_body = quality.removesuffix(b'\n').removesuffix(b'\r')
+            if len(sequence_body) != len(quality_body):
                 raise ReadFateError(f'Sequence/quality length mismatch at record {record_number} in {path}')
-            yield (normalize_read_id(header), sequence.rstrip(b'\r\n'))
+            if not is_valid_fastq_quality(quality_body):
+                raise ReadFateError(f'FASTQ quality must contain ASCII 33..126 at record {record_number} in {path}')
+            yield (normalize_read_id(header), sequence_body)
 
 
 def paired_fastq_records(r1: Path, r2: Path) -> Iterator[tuple[str, bytes, bytes]]:
@@ -257,9 +273,7 @@ def _parse_darlin_sidecar_record(record: Mapping[str, str | None], path: Path, l
     if None in record or any((value is None for value in record.values())):
         raise ReadFateError(f'DARLIN sidecar {path}:{line_number} does not match its fixed columns')
     values = {column: str(record[column]).strip() for column in DARLIN_SIDECAR_COLUMNS}
-    read_id = values['read_id']
-    if normalize_read_id(read_id) != read_id:
-        raise ReadFateError(f'DARLIN sidecar {path}:{line_number} read_id is not normalized: {read_id!r}')
+    read_id = _canonical_read_id(record['read_id'])
     template = values['template']
     if not template:
         raise ReadFateError(f'DARLIN sidecar {path}:{line_number} has an empty template')
@@ -301,7 +315,7 @@ def _populate_darlin_sidecar_store(store: SqliteFateStore, sample_id: str, raw_r
                 raise ReadFateError(f'Duplicate DARLIN template sidecar for sample {sample_id!r}, template {template_name!r}') from exc
         try:
             with _open_text(path) as handle:
-                reader = csv.DictReader(handle, delimiter='\t')
+                reader = csv.DictReader(handle, delimiter='\t', strict=True)
                 if tuple(reader.fieldnames or ()) != DARLIN_SIDECAR_COLUMNS:
                     raise ReadFateError(f'DARLIN sidecar {path} has columns {reader.fieldnames}; expected {DARLIN_SIDECAR_COLUMNS}')
                 for line_number, record in enumerate(reader, start=2):
@@ -443,16 +457,22 @@ def read_evidence_tsv(path: Path, sample_id: str, modality: str) -> list[FateRow
     """Read explicit per-read evidence; aggregate count files are not accepted."""
     _validate_sample_and_modality(sample_id, modality)
     with path.open(newline='', encoding='utf-8') as handle:
-        reader = csv.DictReader(handle, delimiter='\t')
-        if reader.fieldnames is None or not {'read_id', 'fate'}.issubset(reader.fieldnames):
+        reader = csv.DictReader(handle, delimiter='\t', strict=True)
+        fields = reader.fieldnames
+        if (not fields or any(not field or field != field.strip() for field in fields)
+                or len({field.casefold() for field in fields}) != len(fields)):
+            raise ReadFateError(f'Evidence TSV {path} has blank, duplicate or padded columns')
+        if not {'read_id', 'fate'}.issubset(fields):
             raise ReadFateError(f'Evidence TSV {path} must contain read_id and fate columns')
         rows = []
         for line_number, record in enumerate(reader, start=2):
+            if None in record or any(value is None for value in record.values()):
+                raise ReadFateError(f'Evidence TSV {path}:{reader.line_num} does not match its columns')
             row_sample = (record.get('sample_id') or sample_id).strip()
             row_modality = (record.get('modality') or modality).strip().upper()
             if row_sample != sample_id or row_modality != modality:
                 raise ReadFateError(f'Evidence TSV {path} line {line_number} changes inventory identity')
-            read_id = normalize_read_id(record.get('read_id', ''))
+            read_id = _canonical_read_id(record['read_id'])
             fate = (record.get('fate') or '').strip()
             source = (record.get('source') or path.name).strip()
             detail = (record.get('detail') or '').strip()
@@ -476,11 +496,13 @@ def collect_explicit(inventory: set[ReadKey], evidence_rows: Iterable[FateRow]) 
 
 def iter_ledger(path: Path) -> Iterator[FateRow]:
     with path.open(newline='', encoding='utf-8') as handle:
-        reader = csv.DictReader(handle, delimiter='\t')
+        reader = csv.DictReader(handle, delimiter='\t', strict=True)
         if tuple(reader.fieldnames or ()) != TSV_COLUMNS:
             raise ReadFateError(f'Read-fate TSV {path} has columns {reader.fieldnames}; expected {TSV_COLUMNS}')
         for record in reader:
-            key = ReadKey(record['sample_id'], record['modality'], normalize_read_id(record['read_id']))
+            if None in record or any(value is None for value in record.values()):
+                raise ReadFateError(f'Read-fate TSV {path}:{reader.line_num} does not match its fixed columns')
+            key = ReadKey(record['sample_id'], record['modality'], _canonical_read_id(record['read_id']))
             yield FateRow(key, record['fate'], record['source'], record['detail'])
 
 
@@ -539,6 +561,7 @@ def validate_ledger_bundle(tsv: Path, summary_json: Path, checksum_path: Path) -
 
 def write_outputs(rows: Sequence[FateRow], output_tsv: Path, summary_json: Path, checksum_path: Path, source_status: Mapping[str, Mapping[str, str]] | None=None) -> dict[str, object]:
     """Write an in-memory conformance result through the production disk store."""
+    validate_file_outputs((), (output_tsv, summary_json, checksum_path))
     output_tsv.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.read-fate-store-', dir=project_temporary_parent(output_tsv)) as temporary:
         with SqliteFateStore(Path(temporary) / 'fates.sqlite') as store:
@@ -547,8 +570,9 @@ def write_outputs(rows: Sequence[FateRow], output_tsv: Path, summary_json: Path,
             return write_store_outputs(store, output_tsv, summary_json, checksum_path, source_status=source_status)
 
 
-def write_store_outputs(store: SqliteFateStore, output_tsv: Path, summary_json: Path, checksum_path: Path, source_status: Mapping[str, Mapping[str, str]] | None=None) -> dict[str, object]:
+def write_store_outputs(store: SqliteFateStore, output_tsv: Path, summary_json: Path, checksum_path: Path, source_status: Mapping[str, Mapping[str, str]] | None=None, *, input_states: Mapping[Path, os.stat_result] | None=None) -> dict[str, object]:
     """Atomically stream stable TSV, checksum, and summary from a disk index."""
+    validate_file_outputs((store.path,), (output_tsv, summary_json, checksum_path))
     output_tsv.parent.mkdir(parents=True, exist_ok=True)
     summary_json.parent.mkdir(parents=True, exist_ok=True)
     checksum_path.parent.mkdir(parents=True, exist_ok=True)
@@ -596,6 +620,14 @@ def write_store_outputs(store: SqliteFateStore, output_tsv: Path, summary_json: 
         summary: dict[str, object] = {'schema_version': SCHEMA_VERSION, 'kind': 'rna_darlin_read_fate_summary', 'coverage_status': coverage_status, 'selected_modalities': sorted(selected_modalities), 'tsv': {'path': output_tsv.name, 'columns': list(TSV_COLUMNS), 'sha256': digest}, 'conservation': {'status': global_conservation_status, 'input_read_pairs': total_rows, 'output_rows': total_rows, 'missing_fates': 0, 'duplicate_fates': 0, 'conflicting_fates': 0, 'mate_id_mismatches': 0, 'conserved': globally_conserved}, 'branch_conservation': branch_conservation, 'sample_counts': sample_counts, 'modality_counts': modality_counts, 'fate_counts': counts, 'source_status': statuses}
         summary_tmp.write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n', encoding='utf-8')
         checksum_tmp.write_text(f'{digest}  {output_tsv.name}\n', encoding='utf-8')
+        for path, before in (input_states or {}).items():
+            try:
+                after = path.stat()
+            except OSError as exc:
+                raise ReadFateError(f'Read-fate input changed or became unreadable: {path}') from exc
+            if any(getattr(before, key) != getattr(after, key) for key in (
+                    'st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')):
+                raise ReadFateError(f'Read-fate input changed during collection or serialization: {path}')
         checksum_path.unlink(missing_ok=True)
         summary_json.unlink(missing_ok=True)
     return summary
@@ -615,7 +647,8 @@ def build_parser() -> argparse.ArgumentParser:
     explicit.add_argument('--modality', required=True, choices=sorted(FATES_BY_MODALITY))
     explicit.add_argument('--raw-r1', required=True, type=Path)
     explicit.add_argument('--raw-r2', required=True, type=Path)
-    explicit.add_argument('--evidence', required=True, nargs='+', type=Path)
+    explicit.add_argument('--evidence', required=True, nargs='+', type=Path,
+                          help='TSV with canonical read_id matching the raw inventory; no header/mate normalization.')
     _output_arguments(explicit)
     rna = subparsers.add_parser('collect-rna', help='Collect raw RNA barcode-gate fates.')
     rna.add_argument('--sample-id', required=True)
@@ -641,6 +674,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def read_fate_main(argv: Sequence[str] | None=None) -> int:
     args = build_parser().parse_args(argv)
+    inputs = [getattr(args, key) for key in ('raw_r1', 'raw_r2', 'barcode_read', 'insert_read', 'whitelist')
+              if getattr(args, key, None) is not None]
+    inputs.extend(path for key in ('evidence', 'sidecar', 'inputs', 'input_summary', 'input_checksum')
+                  for path in getattr(args, key, ()))
+    validate_file_outputs(inputs, (args.output_tsv, args.summary_json, args.checksum))
+    input_states = {path: path.stat() for path in inputs}
     source_status = None
     if args.command in {'collect', 'collect-rna', 'collect-darlin', 'merge'}:
         if args.command == 'collect':
@@ -682,5 +721,6 @@ def read_fate_main(argv: Sequence[str] | None=None) -> int:
                     observed_rows = store.insert_many(iter_ledger(path))
                     if observed_rows != expected_rows:
                         raise ReadFateError(f'Read-fate summary counts/scope do not match {path.name}')
-            write_store_outputs(store, args.output_tsv, args.summary_json, args.checksum, source_status=source_status)
+            write_store_outputs(store, args.output_tsv, args.summary_json, args.checksum,
+                                source_status=source_status, input_states=input_states)
     return 0

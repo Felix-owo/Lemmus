@@ -2,10 +2,19 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+from decimal import Decimal, InvalidOperation
+from functools import partial
 from pathlib import Path
+
+import numpy as np
 import pandas as pd
+
+from lemmus.config import SAMPLE_ID_PATTERN
+from lemmus.io import validate_delimited_records
 from .config import (
+    DNA_CPG_COUNT_COLUMNS,
     DownstreamQCError,
 )
 
@@ -50,6 +59,8 @@ def resolve_droplet_library_map(dna_manifest, rna_identity):
     """只从 sealed DNA manifest 解析可选 RNA raw 关联；留空的文库保持未关联。"""
     if dna_manifest is None or rna_identity is None:
         raise DownstreamQCError('Droplet linking requires sealed DNA manifest and RNA.h5ad identity')
+    if 'protocol' not in dna_manifest or set(dna_manifest['protocol']) != {'droplet'}:
+        raise DownstreamQCError('Explicit Droplet library mapping requires a Droplet DNA delivery')
     dna = _identity_frame(dna_manifest, ('project_sample_id',), 'DNA sealed manifest')
     if 'rna_sample' not in dna:
         raise DownstreamQCError('DNA sealed manifest lacks rna_sample')
@@ -72,7 +83,7 @@ def resolve_droplet_library_map(dna_manifest, rna_identity):
     return result
 
 
-def validate_droplet_integration_links(summary, dna_manifest):
+def validate_droplet_integration_links(summary, dna_manifest, rna_libraries):
     """续跑读取 Raw/Single 前，核对整合证明确实绑定当前 sealed 文库关联。"""
     if not isinstance(summary.get('library_links'), list):
         raise DownstreamQCError('整合缺少 sealed 文库关联证明，请重新运行整合')
@@ -80,12 +91,14 @@ def validate_droplet_integration_links(summary, dna_manifest):
     links = _identity_frame(pd.DataFrame(summary['library_links'], columns=columns), columns, 'Integration library links')
     if not links.protocol.eq('droplet').all():
         raise DownstreamQCError('整合文库协议不一致，请重新运行整合')
-    rna = links.rename(columns={'rna_project_sample_id': 'sample_id'})
-    expected = resolve_droplet_library_map(dna_manifest, rna)
+    expected = resolve_droplet_library_map(dna_manifest, rna_libraries)
     pairs = links[['dna_project_sample_id', 'rna_sample']].sort_values('dna_project_sample_id')
     if (summary.get('library_map') != expected.attrs['source']
             or pairs.to_dict('records') != expected.to_dict('records')):
         raise DownstreamQCError('整合文库关联与当前 sealed manifest 不一致，请重新运行整合')
+    canonical_by_raw = rna_libraries[['rna_sample', 'sample_id']].drop_duplicates().set_index('rna_sample')['sample_id']
+    if links['rna_project_sample_id'].tolist() != links['rna_sample'].map(canonical_by_raw).tolist():
+        raise DownstreamQCError('整合文库关联与当前 RNA 项目样本不一致，请重新运行整合')
 
 
 def integrate_droplet_qc(rna_qc, dna_qc, dna_manifest, rna_identity):
@@ -97,9 +110,7 @@ def integrate_droplet_qc(rna_qc, dna_qc, dna_manifest, rna_identity):
     dna = _identity_frame(dna_qc, ('Sample_ID', 'CloneID'), 'DNA QC')
     rm = _identity_frame(rna_identity, ('Sample_ID', 'sample_id', 'rna_sample', 'RNA_Barcode'), 'RNA.h5ad identity')
     dm = _identity_frame(dna_manifest, ('sample_id', 'project_sample_id', 'protocol', 'dna_barcode'), 'DNA sealed manifest')
-    links = resolve_droplet_library_map(dm, rm)
-    if set(dm['protocol']) != {'droplet'}:
-        raise DownstreamQCError('Explicit Droplet library mapping requires a Droplet DNA delivery')
+    links = resolve_droplet_library_map(dna_manifest, rm)
     for frame, col, label in ((rna,'Sample_ID','RNA QC'), (dna,'Sample_ID','DNA QC'),
                               (rm,'Sample_ID','RNA identity'), (dm,'sample_id','DNA manifest')):
         if frame[col].duplicated().any():
@@ -111,6 +122,10 @@ def integrate_droplet_qc(rna_qc, dna_qc, dna_manifest, rna_identity):
     for frame, lib, bc in ((rm,'rna_sample','RNA_Barcode'), (dm,'project_sample_id','dna_barcode')):
         if frame[[lib,bc]].duplicated().any() or not frame[bc].map(lambda x: bool(re.fullmatch('[AGT]{17}',x))).all():
             raise DownstreamQCError('Droplet canonical barcodes must be unique AGT17 within each library')
+    if not dm['sample_id'].eq(dm['project_sample_id'] + '_' + dm['dna_barcode']).all():
+        raise DownstreamQCError('DNA Droplet cell ID disagrees with sealed project_sample_id and dna_barcode')
+    if not rm['Sample_ID'].eq(rm['sample_id'] + '_' + rm['RNA_Barcode']).all():
+        raise DownstreamQCError('RNA Droplet cell ID disagrees with finalized sample_id and RNA_Barcode')
     raw_libraries = rm[['rna_sample','sample_id']].drop_duplicates()
     if any(raw_libraries[c].duplicated().any() for c in raw_libraries):
         raise DownstreamQCError('RNA raw library and project sample mapping is not one-to-one')
@@ -285,29 +300,88 @@ def _merge_on_ids(rna: pd.DataFrame, dna: pd.DataFrame) -> pd.DataFrame:
     return integrated
 
 
-def load_dna_qc(dna_project_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _dna_input_state(path: Path) -> tuple[int, ...]:
+    info = path.stat()
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def _dna_table_header(data: bytes, path: Path, sep: str) -> list[str]:
+    try:
+        if b"\0" in data:
+            raise ValueError("embedded NUL byte")
+        with io.TextIOWrapper(io.BytesIO(data), encoding="utf-8-sig", newline="") as handle:
+            return validate_delimited_records(handle, source=path.name, sep=sep)
+    except ValueError as error:
+        raise DownstreamQCError(f"Invalid DNA table {path}: {error}") from error
+
+
+def _parse_dna_site_count(token: str, *, column: str) -> int:
+    message = f"DNAme QC table requires nonnegative integer counts in {column}"
+    if not token.isascii() or "_" in token:
+        raise DownstreamQCError(message)
+    try:
+        value = Decimal(token)
+    except InvalidOperation as error:
+        raise DownstreamQCError(message) from error
+    if not value.is_finite() or not 0 <= value <= 2**64 - 1 or value != value.to_integral_value():
+        raise DownstreamQCError(message)
+    return int(value)
+
+
+def _validate_dna_qc_values(frame: pd.DataFrame, identity_columns: tuple[str, ...]) -> None:
+    if frame.empty:
+        return
+    for column in frame.columns.difference(identity_columns, sort=False):
+        values = frame[column].dropna()
+        if values.empty:
+            continue
+        if (not pd.api.types.is_numeric_dtype(values) or pd.api.types.is_bool_dtype(values)
+                or not np.isfinite(values).all() or values.lt(0).any()):
+            raise DownstreamQCError(f"DNAme QC table has invalid numeric values in {column}")
+
+    for count_column in DNA_CPG_COUNT_COLUMNS:
+        rate_column = count_column.replace("_Unique_CpG_Sites", "_Meth_CpG_Rate%")
+        if rate_column in frame:
+            rates = frame[rate_column]
+            if rates.gt(100).any():
+                raise DownstreamQCError(f"DNAme QC table has percentages above 100 in {rate_column}")
+            if count_column in frame and not rates.isna().equals(frame[count_column].eq(0)):
+                raise DownstreamQCError(f"DNAme QC table has inconsistent CpG counts and {rate_column}")
+
+
+def load_dna_qc(dna_project_dir: Path, *, expected_reference: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """读取当前 complete 交付对应的 DNA QC 与已发布关联，不读取可变 config 或按 mtime 选旧代。"""
-    import csv
-    import io
     import re
 
     root = dna_project_dir.expanduser().resolve()
     marker_path = root / "03_results/run_manifest.json"
+    manifest_path = root / "03_results/QC_Results/sample_manifest.tsv"
+    delivery_paths = (marker_path.parent, marker_path, manifest_path.parent, manifest_path)
+    if any(path.is_symlink() for path in delivery_paths):
+        raise DownstreamQCError("DNA delivery paths must not be symlinks")
     try:
+        marker_state = _dna_input_state(marker_path)
         marker_bytes = marker_path.read_bytes()
         marker = json.loads(marker_bytes)
     except (OSError, ValueError) as error:
         raise DownstreamQCError(f"DNA project has no readable complete run_manifest.json: {root}") from error
     if not isinstance(marker, dict) or not all(isinstance(marker.get(key), dict) for key in ("delivery", "run", "pipeline")):
         raise DownstreamQCError("DNA run_manifest.json has invalid delivery metadata")
+    project_path = marker.get("project_dir")
+    if not isinstance(project_path, str) or "\0" in project_path or not Path(project_path).is_absolute():
+        raise DownstreamQCError("DNA run_manifest.json requires an absolute project_dir")
     delivery = marker["delivery"].get("id", "")
     if (marker.get("schema_version") != 8 or marker.get("status") != "complete"
             or not isinstance(delivery, str) or re.fullmatch(r"[0-9a-f]{64}", delivery) is None
             or marker.get("run", {}).get("snapshot_id") != delivery
             or marker.get("pipeline", {}).get("name") != "Alopex"
-            or Path(str(marker.get("project_dir", ""))).resolve() != root):
+            or Path(project_path).resolve() != root):
         raise DownstreamQCError("DNA run_manifest.json is not a current complete delivery")
-    manifest_path = root / "03_results/QC_Results/sample_manifest.tsv"
+    dna_reference = marker["run"].get("species")
+    if expected_reference is not None and dna_reference != expected_reference:
+        raise DownstreamQCError(
+            f"DNA delivery reference {dna_reference!r} does not match RNA reference {expected_reference!r}"
+        )
     outputs = marker.get("outputs")
     if not isinstance(outputs, list) or not all(isinstance(entry, dict) for entry in outputs):
         raise DownstreamQCError("DNA run_manifest.json has invalid output inventory")
@@ -315,12 +389,14 @@ def load_dna_qc(dna_project_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     if len(entries) != 1:
         raise DownstreamQCError("DNA delivery does not declare one sealed sample_manifest.tsv")
     try:
+        manifest_state = _dna_input_state(manifest_path)
         manifest_bytes = manifest_path.read_bytes()
     except OSError as error:
         raise DownstreamQCError(f"Cannot read DNA sealed sample_manifest.tsv: {manifest_path}") from error
     manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
     if entries[0].get("size_bytes") != len(manifest_bytes) or entries[0].get("sha256") != manifest_hash:
         raise DownstreamQCError("DNA sealed sample_manifest.tsv disagrees with the published inventory")
+    _dna_table_header(manifest_bytes, manifest_path, "\t")
     manifest = pd.read_csv(io.BytesIO(manifest_bytes), sep="\t", dtype=str, keep_default_na=False)
     required = {"sample_id", "project_sample_id", "plate_id", "dna_raw_sample", "rna_sample", "protocol",
                 "dna_status", "analysis_status", "backend_qc_status", "cpg_path"}
@@ -329,13 +405,44 @@ def load_dna_qc(dna_project_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
         raise DownstreamQCError(f"DNA sealed sample_manifest.tsv lacks required columns: {missing}")
     if manifest["sample_id"].duplicated().any():
         raise DownstreamQCError("DNA sealed sample_manifest.tsv sample_id is not unique")
+    droplets = manifest["protocol"].eq("droplet")
+    if not manifest["project_sample_id"].str.fullmatch(SAMPLE_ID_PATTERN, na=False).all():
+        raise DownstreamQCError("DNA sealed manifest has an invalid project_sample_id")
+    if not manifest["dna_raw_sample"].str.fullmatch(SAMPLE_ID_PATTERN, na=False).all():
+        raise DownstreamQCError("DNA sealed manifest has an invalid dna_raw_sample")
+    rna_samples = manifest["rna_sample"]
+    if not (rna_samples.eq("") | rna_samples.str.fullmatch(SAMPLE_ID_PATTERN, na=False)).all():
+        raise DownstreamQCError("DNA sealed manifest has an invalid rna_sample")
+    if not manifest.loc[~droplets, "plate_id"].str.fullmatch(SAMPLE_ID_PATTERN, na=False).all():
+        raise DownstreamQCError("DNA sealed manifest has an invalid plate_id for a plate cell")
+    suffix = manifest["plate_id"].copy()
+    if droplets.any():
+        if ("dna_barcode" not in manifest
+                or not manifest.loc[droplets, "dna_barcode"].str.fullmatch(r"[AGT]{17}").all()
+                or manifest.loc[droplets, "plate_id"].ne("").any()):
+            raise DownstreamQCError("DNA sealed Droplet manifest requires a full AGT17 barcode and empty plate_id")
+        suffix.loc[droplets] = manifest.loc[droplets, "dna_barcode"]
+    if not manifest["sample_id"].eq(manifest["project_sample_id"] + "_" + suffix).all():
+        raise DownstreamQCError("DNA sealed manifest cell ID disagrees with the project sample and plate or barcode")
+    active_mask = manifest["dna_status"].eq("Pass")
+    valid_active = (active_mask & manifest["analysis_status"].eq("PASS")
+                    & manifest["backend_qc_status"].eq("PASS") & manifest["cpg_path"].str.strip().ne(""))
+    valid_inactive = (manifest["dna_status"].isin(["Zero_Output", "Low_Reads_Removed"])
+                      & manifest["analysis_status"].eq("NOT_ANALYZED")
+                      & manifest["backend_qc_status"].eq("NOT_RUN") & manifest["cpg_path"].eq(""))
+    invalid_status = ~(valid_active | valid_inactive)
+    if invalid_status.any():
+        cell_id = manifest.loc[invalid_status, "sample_id"].iloc[0]
+        raise DownstreamQCError(f"DNA sealed manifest has inconsistent cell status for {cell_id!r}")
+    active = manifest.loc[active_mask]
     downstream_root = root / "06_downstream"
     qc_path = downstream_root / "DNAme_QC_Information.csv"
     completion = downstream_root / ".cache/DNAme_QC_Input_Identity.json"
-    if any(path.is_symlink() for path in (downstream_root, completion.parent, completion, qc_path)):
+    qc_paths = (downstream_root, completion.parent, completion, qc_path)
+    if any(path.is_symlink() for path in qc_paths):
         raise DownstreamQCError("DNA downstream QC paths must not be symlinks")
     try:
-        completion_state = completion.stat()
+        completion_state = _dna_input_state(completion)
         completion_bytes = completion.read_bytes()
         identity = json.loads(completion_bytes)
     except (OSError, ValueError) as error:
@@ -345,31 +452,43 @@ def load_dna_qc(dna_project_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
             or identity.get('run_manifest_sha256') != hashlib.sha256(marker_bytes).hexdigest()):
         raise DownstreamQCError("Current DNA delivery disagrees with downstream QC completion; run DNA downstream")
     try:
+        qc_state = _dna_input_state(qc_path)
         qc_bytes = qc_path.read_bytes()
     except OSError as error:
         raise DownstreamQCError(f"Current DNA delivery has no downstream QC table; run DNA downstream: {qc_path}") from error
-    fields = next(csv.reader(io.StringIO(qc_bytes.decode("utf-8-sig"))))
+    fields = _dna_table_header(qc_bytes, qc_path, ",")
     identity_columns = ("Sample_ID", "CloneID", "PlateID")
+    missing = sorted(set(identity_columns) - set(fields))
+    if missing:
+        raise DownstreamQCError(f"DNAme QC table lacks required identity columns: {missing}")
     na_values = {column: ["", "nan", "NaN", "NA", "N/A", "None", "null"] for column in fields if column not in identity_columns}
+    converters = {column: partial(_parse_dna_site_count, column=column)
+                  for column in DNA_CPG_COUNT_COLUMNS if column in fields}
     dna_qc = pd.read_csv(io.BytesIO(qc_bytes), dtype={column: str for column in identity_columns},
-                         keep_default_na=False, na_values=na_values, float_precision="round_trip")
-    dna_qc = _identity_frame(dna_qc, ("Sample_ID", "CloneID"), "DNAme QC table")
-    dna_qc["PlateID"] = dna_qc["PlateID"].fillna("").astype(str)
-    active = manifest.loc[(manifest["dna_status"] == "Pass") & (manifest["analysis_status"] == "PASS")
-                          & (manifest["backend_qc_status"] == "PASS") & manifest["cpg_path"].ne("")]
+                         converters=converters, keep_default_na=False, na_values=na_values,
+                         float_precision="round_trip")
+    _validate_dna_qc_values(dna_qc, identity_columns)
     if dna_qc["Sample_ID"].duplicated().any() or set(active["sample_id"]) != set(dna_qc["Sample_ID"]):
         raise DownstreamQCError("Current DNA QC cells disagree with the active sealed manifest cells")
+    aligned = active.set_index("sample_id").reindex(dna_qc["Sample_ID"])
+    for qc_column, manifest_column in (("CloneID", "project_sample_id"), ("PlateID", "plate_id")):
+        if dna_qc[qc_column].tolist() != aligned[manifest_column].tolist():
+            raise DownstreamQCError(f"DNAme {qc_column} disagrees with the sealed DNA manifest")
+    states = ((manifest_path, manifest_state), (qc_path, qc_state),
+              (completion, completion_state), (marker_path, marker_state))
     try:
-        after = completion.stat()
-        state_keys = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
-        unchanged = all(getattr(after, key) == getattr(completion_state, key) for key in state_keys)
-        unchanged = unchanged and completion.read_bytes() == completion_bytes
+        unchanged = (completion.read_bytes() == completion_bytes
+                     and marker_path.read_bytes() == marker_bytes
+                     and not any(path.is_symlink() for path in (*delivery_paths, *qc_paths))
+                     and all(_dna_input_state(path) == state for path, state in states))
     except OSError:
         unchanged = False
-    if not unchanged or marker_path.read_bytes() != marker_bytes:
+    if not unchanged:
         raise DownstreamQCError("DNA delivery or QC completion changed while reading QC inputs; retry integration")
     dna_qc.attrs["dna_provenance"] = {
         "project_dir": str(root), "delivery_id": delivery, "run_manifest_sha256": hashlib.sha256(marker_bytes).hexdigest(),
+        "qc_completion_sha256": hashlib.sha256(completion_bytes).hexdigest(),
+        "raw_generation": identity.get("raw_generation"),
         "sealed_manifest_sha256": manifest_hash, "qc_path": str(qc_path), "qc_sha256": hashlib.sha256(qc_bytes).hexdigest(),
     }
     return dna_qc, manifest

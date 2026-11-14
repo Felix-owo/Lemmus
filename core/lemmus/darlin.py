@@ -1,6 +1,6 @@
 """Lemmus：DARLIN 流式提取、共识与 clone 交付。"""
 from __future__ import annotations
-from .io import project_temporary_parent, atomic_output
+from .io import project_temporary_parent, atomic_output, validate_file_outputs, read_delimited_frame, stable_file_identity, is_valid_fastq_quality, file_stat_identity, assert_file_states_unchanged
 
 import argparse
 import csv
@@ -13,6 +13,7 @@ import sys
 import time
 import tempfile
 from contextlib import ExitStack
+from decimal import Decimal, InvalidOperation
 from itertools import islice
 from pathlib import Path
 import numpy as np
@@ -21,8 +22,12 @@ from .config import (
     DEFAULT_EXTRACTION,
     DEFAULT_QC,
     select_config,
+    SAMPLE_ID_PATTERN,
+    read_config_mapping,
+    validate_config,
+    DARLIN_SOURCE_CONTRACT,
 )
-from .inputs import (_barcode_map_digest)
+from .inputs import (_barcode_map_digest, read_manifest, darlin_source_roles)
 
 
 CA_5prime = 'AGCTGTACAAGTAAGCGGC'
@@ -279,16 +284,17 @@ def iter_CARLIN_raw_read_chunks(data_path, sample, *, cell_barcode_length, umi_l
     record_number = 0
     batch_lines = 4 * chunk_size
 
-    def _normalize_headers(headers):
+    def _normalize_headers(headers, path, base):
         read_ids = []
-        for header in headers:
+        for index, header in enumerate(headers):
             if not header.startswith('@'):
-                raise ValueError(f'Invalid FASTQ header (expected @): {header[:80]!r}')
-            read_id = header[1:].split(None, 1)[0].strip()
+                raise ValueError(f'Invalid FASTQ header (expected @) at record {base + index + 1}: {path}: {header[:80]!r}')
+            fields = header[1:].split(None, 1)
+            read_id = fields[0] if fields and not header[1:2].isspace() else ''
             if read_id.endswith(('/1', '/2')):
                 read_id = read_id[:-2]
             if not read_id:
-                raise ValueError('DARLIN read identifier is empty after normalization')
+                raise ValueError(f'DARLIN read identifier is empty after normalization at record {base + index + 1}: {path}')
             read_ids.append(read_id)
         return read_ids
 
@@ -317,17 +323,24 @@ def iter_CARLIN_raw_read_chunks(data_path, sample, *, cell_barcode_length, umi_l
                 tag_headers = [line.rstrip('\r\n') for line in tag_lines[0::4]]
                 tags = [line.rstrip('\r\n') for line in tag_lines[1::4]]
                 tag_qualities = [line.rstrip('\r\n') for line in tag_lines[3::4]]
-                bad_plus = next((index for index, line in enumerate(pluses) if not line.rstrip('\r\n').startswith('+')), None)
-                if bad_plus is not None:
-                    raise ValueError(f'Invalid FASTQ + line at record {base + bad_plus + 1}: {seq_path}')
-                bad_length = next((index for index, (sequence, quality) in enumerate(zip(sequences, qualities, strict=True)) if len(sequence) != len(quality)), None)
-                if bad_length is not None:
-                    raise ValueError(
-                        f'DARLIN FASTQ sequence/quality length mismatch at record {base + bad_length + 1}: '
-                        f'{seq_path} ({len(sequences[bad_length])} != {len(qualities[bad_length])})'
-                    )
-                seq_ids = _normalize_headers(headers)
-                tag_ids = _normalize_headers(tag_headers)
+                for path, mate_sequences, mate_pluses, mate_qualities in (
+                    (seq_path, sequences, pluses, qualities),
+                    (tag_path, tags, tag_lines[2::4], tag_qualities),
+                ):
+                    bad_plus = next((index for index, line in enumerate(mate_pluses) if not line.startswith('+')), None)
+                    if bad_plus is not None:
+                        raise ValueError(f'Invalid FASTQ + line at record {base + bad_plus + 1}: {path}')
+                    bad_length = next((index for index, (sequence, quality) in enumerate(zip(mate_sequences, mate_qualities, strict=True)) if len(sequence) != len(quality)), None)
+                    if bad_length is not None:
+                        raise ValueError(
+                            f'DARLIN FASTQ sequence/quality length mismatch at record {base + bad_length + 1}: '
+                            f'{path} ({len(mate_sequences[bad_length])} != {len(mate_qualities[bad_length])})'
+                        )
+                    bad_quality = next((index for index, quality in enumerate(mate_qualities) if not quality or not is_valid_fastq_quality(quality)), None)
+                    if bad_quality is not None:
+                        raise ValueError(f'DARLIN FASTQ quality must contain ASCII 33..126 at record {base + bad_quality + 1}: {path}')
+                seq_ids = _normalize_headers(headers, seq_path, base)
+                tag_ids = _normalize_headers(tag_headers, tag_path, base)
                 if seq_ids != tag_ids:
                     index = next(index for index, (left, right) in enumerate(zip(seq_ids, tag_ids, strict=True)) if left != right)
                     raise ValueError(f'DARLIN paired FASTQ read-ID mismatch at record {base + index + 1}: {seq_ids[index]!r} != {tag_ids[index]!r}')
@@ -610,6 +623,8 @@ def denoise_sequence(input_seqs, read_count):
     seq_count = {}
     for seq, count in zip(seqs, counts, strict=True):
         seq_count[seq] = seq_count.get(seq, 0) + int(count)
+    # UMI-tools visits equally supported roots in input order.
+    seq_count = dict(sorted(seq_count.items()))
     from umi_tools import UMIClusterer
     mapping = {}
     for cluster in UMIClusterer(cluster_method='directional')(seq_count, threshold=1):
@@ -663,9 +678,6 @@ def group_cells(df_HQ, group_keys=('library', 'cell_id', 'clone_id')):
     return df_out.reset_index()
 
 
-darlin_yaml = None
-
-
 ASSIGNMENT_METHOD = 'biological_cell_exact_barcode_union_v3'
 
 
@@ -705,28 +717,19 @@ DEFAULT_TEMPLATE_LOCUS = {'cCARLIN': 'CA', 'Rosa': 'RA', 'Rosa_v2': 'RA', 'Tigre
 FINAL_COLUMNS = ['Sample_ID', 'DARLIN_Clone_ID', 'DARLIN_QC_Pass', 'DARLIN_QC_Status', 'DARLIN_Loci', 'DARLIN_Barcode_Summary', 'DARLIN_Total_Read_Count', 'DARLIN_Total_UMI_Count', 'DARLIN_Min_Barcode_Read_Count', 'DARLIN_Min_Barcode_UMI_Count', 'DARLIN_Min_Cell_Read_Fraction', 'DARLIN_3Prime_Evidence', 'DARLIN_Max_3Prime_Mismatch_Count', 'DARLIN_Max_Ambiguous_Base_Count', 'DARLIN_Barcode_Complexity', 'DARLIN_Assignment_Method', 'DARLIN_Assignment_Read_Support_Fraction', 'DARLIN_Assignment_UMI_Support_Fraction', 'DARLIN_Reference_QC_Status', 'DARLIN_Reference_Evidence_Method', 'DARLIN_Reference_Evidence_Complete', 'DARLIN_Reference_Evidence_Barcodes', 'DARLIN_Max_Reference_Sample_Count_Observed', 'DARLIN_Max_QC_Passing_Biological_Sample_Count', 'DARLIN_Double_Cell_Suspect', 'DARLIN_Double_Cell_Reason', 'DARLIN_Aggregation_Warnings', 'DARLIN_Source_Duplicate_Count', 'DARLIN_Barcodes_Total', 'DARLIN_Barcodes_After_Read_QC', 'DARLIN_Barcodes_After_UMI_QC', 'DARLIN_Barcodes_After_Edit_QC', 'DARLIN_Barcodes_After_3Prime_QC', 'DARLIN_Barcodes_After_3Prime_Mismatch_QC', 'DARLIN_Barcodes_After_Reference_QC', 'DARLIN_Barcodes_After_Sequence_QC', 'DARLIN_Barcodes_Used', 'QC_Extraction_Read_Cutoff', 'QC_Extraction_3Prime_Max_Mismatches', 'QC_Extraction_Min_Cell_Read_Fraction', 'QC_Min_Read_Count', 'QC_Min_UMI_Count', 'QC_Require_Edited_Barcode', 'QC_Require_3Prime_Detected', 'QC_Max_3Prime_Mismatches', 'QC_Allow_Read_End_Rescue', 'QC_Min_Read_End_Read_Count', 'QC_Min_Read_End_UMI_Count', 'QC_Min_Read_End_Cell_Read_Fraction', 'QC_Min_Read_End_Barcode_Length', 'QC_Max_Ambiguous_Bases', 'QC_Max_Barcode_Complexity', 'QC_Max_Reference_Sample_Count', 'QC_Require_Reference_Evidence', 'Barcode_Map_SHA256', 'Barcode_Map_Rows']
 
 
-BARCODE_COLUMNS = ['library', 'cell_id', 'cell_bc', 'clone_id', '5prime_match_type', '5prime_edit_distance', '3prime_detected', '3prime_match_type', '3prime_mismatch_count', 'read', 'umi_count', 'bc_length', 'total_read_per_cell', 'total_read_per_clone', 'cell_read_fraction', 'clone_read_fraction', 'edited', REFERENCE_EVIDENCE_COLUMN]
+BARCODE_COLUMNS = ['library', 'cell_id', 'cell_bc', 'clone_id', '5prime_match_type', '5prime_edit_distance', '3prime_detected', '3prime_match_type', '3prime_mismatch_count', 'read', 'umi_count', 'bc_length', 'total_read_per_cell', 'total_read_per_clone', 'cell_read_fraction', 'clone_read_fraction', 'edited', REFERENCE_EVIDENCE_COLUMN, 'source_type', 'source_identity_contract']
 
 
 AGGREGATION_COLUMNS = ['evidence_class', 'source_sample', BIOLOGICAL_SOURCE_COLUMN, CANONICAL_CELL_BARCODE_COLUMN, NORMALIZED_BARCODE_COLUMN, 'source_samples', 'physical_source_count', SOURCE_DUPLICATE_COUNT_COLUMN, SOURCE_DUPLICATE_WARNING_COLUMN, SOURCE_DUPLICATE_CONFLICT_COLUMN, OBSERVED_EVIDENCE_COLUMN, QC_PASSING_EVIDENCE_COLUMN, 'template', 'locus']
 
 
-def _load_runtime_deps():
-    """Import heavy table dependencies only when work is executed."""
-    global pd, darlin_yaml
-    if darlin_yaml is None:
-        import yaml as _yaml
-        darlin_yaml = _yaml
-
-
 def _read_yaml(path):
-    _load_runtime_deps()
     if path is None:
         return {}
-    if not Path(path).exists():
-        return {}
-    with open(path, encoding='utf-8') as handle:
-        return select_config(darlin_yaml.safe_load(handle) or {})
+    document = read_config_mapping(path)
+    if {'schema_version', 'pipeline_mode', 'cabernet', 'droplet'}.intersection(document):
+        validate_config(document)
+    return select_config(document)
 
 
 def _clone_config(config):
@@ -751,7 +754,17 @@ def _ensure_parent(path):
 def _read_csv_rows(path):
     with Path(path).open(newline='', encoding='utf-8-sig') as handle:
         delimiter = '\t' if Path(path).suffix.lower() in {'.tsv', '.txt'} else ','
-        return [{k: (v or '').strip() for k, v in row.items()} for row in csv.DictReader(handle, delimiter=delimiter)]
+        reader = csv.DictReader(handle, delimiter=delimiter)
+        fields = reader.fieldnames or []
+        if (not fields or any(not field or field != field.strip() for field in fields)
+                or len({field.casefold() for field in fields}) != len(fields)):
+            raise ValueError(f'{path}: header has blank, duplicate or padded columns')
+        rows = []
+        for number, row in enumerate(reader, 2):
+            if None in row or any(value is None for value in row.values()):
+                raise ValueError(f'{path}:{number}: field count differs from its header')
+            rows.append({key:value.strip() for key, value in row.items()})
+        return rows
 
 
 def _resolve_project_path(value, project_dir):
@@ -773,48 +786,38 @@ def _cell_name_maps(raw_config):
     for label, path in (('项目样本清单', manifest), ('项目条码表', barcode_map)):
         if not Path(path).is_file():
             raise FileNotFoundError(f'{label}不存在: {path}')
-    project_by_sample = {}
-    for row in _read_csv_rows(manifest):
-        project_sample = row.get('sample_id', '')
-        if not project_sample:
-            continue
-        for key in ('sample_id', 'rna_sample', 'darlin_sample'):
-            value = row.get(key, '')
-            if value:
-                project_by_sample[value] = project_sample
-    plate_by_rna_barcode = {row.get('RNA_Barcode', ''): row.get('PlateID', '') for row in _read_csv_rows(barcode_map) if row.get('RNA_Barcode', '') and row.get('PlateID', '')}
+    # 当前DAG已把各模态raw名称映射为sample_id；raw名称不进入canonical身份域。
+    project_by_sample = {row['sample_id']:row['sample_id'] for row in read_manifest(manifest)[1]}
+    plate_by_rna_barcode = {}
+    seen_plates, seen_orders = set(), set()
+    for row in _read_csv_rows(barcode_map):
+        barcode, plate, order = (row.get(key, '') for key in ('RNA_Barcode', 'PlateID', 'Cell_Order'))
+        if not barcode or not plate or not order:
+            raise ValueError(f'{barcode_map}: RNA_Barcode, PlateID and Cell_Order are required')
+        if barcode in plate_by_rna_barcode or plate in seen_plates or order in seen_orders:
+            raise ValueError(f'{barcode_map}: Duplicate RNA_Barcode, PlateID or Cell_Order')
+        plate_by_rna_barcode[barcode] = plate
+        seen_plates.add(plate)
+        seen_orders.add(order)
+    if not plate_by_rna_barcode:
+        raise ValueError(f'{barcode_map}: no RNA cell identities')
     return (project_by_sample, plate_by_rna_barcode)
-
-
-def _biological_source_sample(source_sample):
-    """Collapse physical RNA-derived inputs onto their biological library."""
-    return str(source_sample).strip().removesuffix('__RNA')
 
 
 def _canonical_cell_id(cell_id, *, source_sample, cell_barcode, project_by_sample, plate_by_rna_barcode):
     """Return one biological cell identity across raw and RNA-derived inputs."""
     physical_source = str(source_sample).strip()
-    biological_source = _biological_source_sample(physical_source)
-    cell_bc = str(cell_barcode).strip()
+    cell_bc = '' if pd.isna(cell_barcode) else str(cell_barcode).strip()
     raw_cell_id = str(cell_id).strip()
     if not cell_bc and physical_source and raw_cell_id.startswith(f'{physical_source}_'):
         cell_bc = raw_cell_id[len(physical_source) + 1:]
-    project_sample = project_by_sample.get(biological_source, '')
+    project_sample = project_by_sample.get(physical_source, '')
     if not project_sample:
-        for candidate in sorted(set(project_by_sample.values()), key=len, reverse=True):
-            if candidate and biological_source.startswith(f'{candidate}_'):
-                project_sample = candidate
-                break
-    if not project_sample:
-        project_sample = biological_source
+        raise ValueError(f'DARLIN source is not a canonical sample_id in the current manifest: {physical_source!r}')
     plate_id = plate_by_rna_barcode.get(cell_bc, '')
-    if project_sample and plate_id:
-        return f'{project_sample}_{plate_id}'
-    if project_sample and cell_bc:
-        return f'{project_sample}_{cell_bc}'
-    if physical_source.endswith('__RNA') and raw_cell_id.startswith(f'{physical_source}_'):
-        return f'{biological_source}_{raw_cell_id[len(physical_source) + 1:]}'
-    return raw_cell_id
+    if not plate_id:
+        raise ValueError(f'DARLIN cell barcode cannot be resolved in Barcode_Map.csv: {cell_bc!r}')
+    return f'{project_sample}_{plate_id}'
 
 
 def _collapse_duplicate_sample_ids(final):
@@ -833,16 +836,31 @@ def _as_bool_series(series):
 def _numeric_series(df, column, default=0):
     if column not in df.columns:
         return pd.Series(default, index=df.index, dtype='float64')
+    if column in ('read', 'umi_count'):
+        return df[column].astype(object)
     return pd.to_numeric(df[column], errors='coerce').fillna(default)
 
 
 def _read_table(path):
     """读取当前版本的带表头 barcode CSV；损坏或零字节输入直接失败。"""
-    _load_runtime_deps()
-    df = pd.read_csv(path)
-    unnamed = [col for col in df.columns if str(col).startswith('Unnamed:')]
-    if unnamed:
-        df = df.drop(columns=unnamed)
+    identity_columns = ('library', 'cell_id', 'cell_bc', 'clone_id', 'source_sample',
+                        BIOLOGICAL_SOURCE_COLUMN, CANONICAL_CELL_BARCODE_COLUMN,
+                        NORMALIZED_BARCODE_COLUMN, 'source_samples', 'template', 'locus')
+    df = read_delimited_frame(path, dtype={key:str for key in (*identity_columns, 'read', 'umi_count')})
+    for column in ('read', 'umi_count'):
+        if column not in df:
+            raise ValueError(f'{path}: missing molecular count column {column}')
+        counts = []
+        for row, token in enumerate(df[column], 2):
+            try:
+                value = Decimal(token)
+            except InvalidOperation:
+                value = Decimal('NaN')
+            if not value.is_finite() or value < 0 or value != value.to_integral_value():
+                raise ValueError(f'{path}:{row}: {column} must be a finite nonnegative integer count: {token!r}')
+            counts.append(int(value))
+        # Python integers preserve exact support through independent-source sums.
+        df[column] = pd.Series(counts, index=df.index, dtype=object)
     return df
 
 
@@ -852,7 +870,7 @@ def _normalized_exact_barcode(value):
     return text.upper()
 
 
-def _canonical_cell_barcode(row, source_sample):
+def _canonical_cell_barcode(row, source_sample, biological_sample):
     value = row.get('cell_bc', '')
     cell_barcode = '' if pd.isna(value) else str(value).strip().upper()
     if cell_barcode:
@@ -860,7 +878,7 @@ def _canonical_cell_barcode(row, source_sample):
     raw_cell_id = row.get('cell_id', '')
     raw_cell_id = '' if pd.isna(raw_cell_id) else str(raw_cell_id).strip()
     physical_source = str(source_sample).strip()
-    for prefix in (physical_source, _biological_source_sample(physical_source)):
+    for prefix in (physical_source, biological_sample):
         if prefix and raw_cell_id.startswith(f'{prefix}_'):
             return raw_cell_id[len(prefix) + 1:].strip().upper()
     return raw_cell_id.upper()
@@ -898,7 +916,7 @@ def _catalog_match_rna_allele(candidate, catalog, *, max_edits=1, min_partial_le
     return (target, kind)
 
 
-def _apply_rna_allele_catalog_rescue(merged, extraction):
+def _apply_rna_allele_catalog_rescue(merged, extraction, rna_sources):
     """Gate sparse RNA-derived calls against the paired targeted allele catalog.
 
     Targeted calls define a sample/locus catalog. RNA-derived evidence may be
@@ -908,12 +926,9 @@ def _apply_rna_allele_catalog_rescue(merged, extraction):
     if merged.empty or 'source_sample' not in merged.columns:
         return merged
     merged = merged.copy()
-    merged['evidence_class'] = np.where(
-        merged['source_sample'].astype(str).str.endswith('__RNA'),
-        'RNA_UNCLASSIFIED', 'TARGETED'
-    )
-    targeted = merged[~merged['source_sample'].astype(str).str.endswith('__RNA')]
-    rna_mask = merged['source_sample'].astype(str).str.endswith('__RNA')
+    rna_mask = merged['source_sample'].isin(rna_sources)
+    merged['evidence_class'] = np.where(rna_mask, 'RNA_UNCLASSIFIED', 'TARGETED')
+    targeted = merged[~rna_mask]
     if not rna_mask.any():
         return merged
     max_edits = int(extraction.get('rna_catalog_max_edits', 1))
@@ -926,8 +941,8 @@ def _apply_rna_allele_catalog_rescue(merged, extraction):
         (biological, locus): sorted(set(group[NORMALIZED_BARCODE_COLUMN].astype(str)))
         for (biological, locus), group in targeted.groupby([BIOLOGICAL_SOURCE_COLUMN, 'locus'], sort=False, observed=True)
     }
-    read_support_values = pd.to_numeric(merged['read'], errors='coerce').fillna(0.0) if 'read' in merged.columns else pd.Series(0.0, index=merged.index)
-    umi_support_values = pd.to_numeric(merged['umi_count'], errors='coerce').fillna(0.0) if 'umi_count' in merged.columns else pd.Series(0.0, index=merged.index)
+    read_support_values = _numeric_series(merged, 'read')
+    umi_support_values = _numeric_series(merged, 'umi_count')
     fiveprime_edit_values = pd.to_numeric(merged['5prime_edit_distance'], errors='coerce').fillna(-1.0) if '5prime_edit_distance' in merged.columns else pd.Series(-1.0, index=merged.index)
     detected_values = merged['3prime_detected'].fillna(False).astype(bool) if '3prime_detected' in merged.columns else pd.Series(False, index=merged.index)
     for index in merged.index[rna_mask]:
@@ -944,8 +959,8 @@ def _apply_rna_allele_catalog_rescue(merged, extraction):
             merged.at[index, 'clone_id'] = target
             merged.at[index, 'evidence_class'] = evidence
             continue
-        read_support = float(read_support_values.loc[index])
-        umi_support = float(umi_support_values.loc[index])
+        read_support = int(read_support_values.loc[index])
+        umi_support = int(umi_support_values.loc[index])
         dual_anchor = bool(detected_values.loc[index]) and float(fiveprime_edit_values.loc[index]) >= 0
         if read_support >= novel_min_reads and umi_support >= novel_min_umis and dual_anchor:
             merged.at[index, 'evidence_class'] = 'RNA_NOVEL_HIGH_CONFIDENCE'
@@ -971,8 +986,8 @@ def _collapse_source_candidates(merged, payload_columns):
         duplicate_count = int(len(group) - len(unique))
         ordered_indices = sorted(unique.index, key=lambda index: _stable_row_signature(unique.loc[index], payload_columns))
         representative = unique.loc[ordered_indices[0]].copy()
-        representative['read'] = float(_numeric_series(unique, 'read').max())
-        representative['umi_count'] = float(_numeric_series(unique, 'umi_count').max())
+        representative['read'] = int(_numeric_series(unique, 'read').max())
+        representative['umi_count'] = int(_numeric_series(unique, 'umi_count').max())
         representative[SOURCE_DUPLICATE_COUNT_COLUMN] = duplicate_count
         representative[SOURCE_DUPLICATE_WARNING_COLUMN] = duplicate_count > 0
         representative[SOURCE_DUPLICATE_CONFLICT_COLUMN] = len(unique) > 1
@@ -993,14 +1008,15 @@ def _aggregate_biological_candidates(source_candidates):
         cell_barcode = str(representative[CANONICAL_CELL_BARCODE_COLUMN]).strip()
         exact_barcode = str(representative[NORMALIZED_BARCODE_COLUMN]).strip()
         representative['source_sample'] = biological_source
+        representative['source_type'] = '+'.join(sorted(set(group['source_type'])))
         representative['source_samples'] = ';'.join(source_samples)
         representative['physical_source_count'] = len(source_samples)
         representative['library'] = biological_source
         representative['cell_bc'] = cell_barcode
         representative['cell_id'] = f'{biological_source}_{cell_barcode}' if biological_source and cell_barcode else str(representative.get('cell_id', '')).strip()
         representative['clone_id'] = exact_barcode
-        representative['read'] = float(_numeric_series(group, 'read').sum())
-        representative['umi_count'] = float(_numeric_series(group, 'umi_count').sum())
+        representative['read'] = int(_numeric_series(group, 'read').sum())
+        representative['umi_count'] = int(_numeric_series(group, 'umi_count').sum())
         representative['bc_length'] = len(exact_barcode)
         representative['edited'] = bool(_as_bool_series(group['edited']).any() if 'edited' in group.columns else False)
         representative['3prime_detected'] = bool(_as_bool_series(group['3prime_detected']).any() if '3prime_detected' in group.columns else False)
@@ -1016,11 +1032,13 @@ def _aggregate_biological_candidates(source_candidates):
     aggregated = pd.DataFrame(rows) if rows else source_candidates.iloc[0:0].copy()
     if aggregated.empty:
         return aggregated
+    aggregated['read'] = aggregated['read'].astype(object)
+    aggregated['umi_count'] = aggregated['umi_count'].astype(object)
     cell_group = [BIOLOGICAL_SOURCE_COLUMN, CANONICAL_CELL_BARCODE_COLUMN, 'locus']
     aggregated['total_read_per_cell'] = aggregated.groupby(cell_group, sort=False)['read'].transform('sum')
     aggregated['total_read_per_clone'] = aggregated.groupby(['locus', NORMALIZED_BARCODE_COLUMN], sort=False)['read'].transform('sum')
-    aggregated['cell_read_fraction'] = aggregated['read'] / aggregated['total_read_per_cell']
-    aggregated['clone_read_fraction'] = aggregated['read'] / aggregated['total_read_per_clone']
+    aggregated['cell_read_fraction'] = aggregated['read'] / aggregated['total_read_per_cell'].where(aggregated['total_read_per_cell'].ne(0))
+    aggregated['clone_read_fraction'] = aggregated['read'] / aggregated['total_read_per_clone'].where(aggregated['total_read_per_clone'].ne(0))
     return aggregated
 
 
@@ -1041,24 +1059,39 @@ def _attach_recurrence_evidence(aggregated, qc):
     return aggregated
 
 
-def _write_merged_table(frame, output, checksum_output=None):
+def _assert_inputs_unchanged(identities):
+    for path, expected in identities:
+        try:
+            observed = stable_file_identity(path)
+        except FileNotFoundError as exc:
+            raise ValueError(f'DARLIN input changed before commit: {path}') from exc
+        if observed != expected:
+            raise ValueError(f'DARLIN input changed before commit: {path}')
+
+
+def _write_merged_table(frame, output, checksum_output=None, *, input_identities=()):
     destination = Path(output)
-    _ensure_parent(destination)
-    if destination.suffix == '.gz':
-        with destination.open('wb') as raw_handle:
-            with gzip.GzipFile(filename='', fileobj=raw_handle, mode='wb', mtime=0) as gzip_handle:
-                with io.TextIOWrapper(gzip_handle, encoding='utf-8', newline='') as text_handle:
-                    frame.to_csv(text_handle, index=False)
-    else:
-        frame.to_csv(destination, index=False)
-    if checksum_output is not None:
-        checksum_path = Path(checksum_output)
-        _ensure_parent(checksum_path)
-        digest = hashlib.sha256(destination.read_bytes()).hexdigest()
-        checksum_path.write_text(f'{digest}  {destination.name}\n', encoding='ascii')
+    checksum_path = Path(checksum_output) if checksum_output is not None else None
+    validate_file_outputs((), [destination, *([checksum_path] if checksum_path is not None else [])])
+    with ExitStack() as commits:
+        checksum_tmp = commits.enter_context(atomic_output(checksum_path)) if checksum_path is not None else None
+        temporary = commits.enter_context(atomic_output(destination))
+        if destination.suffix == '.gz':
+            with temporary.open('wb') as raw_handle:
+                with gzip.GzipFile(filename='', fileobj=raw_handle, mode='wb', mtime=0) as gzip_handle:
+                    with io.TextIOWrapper(gzip_handle, encoding='utf-8', newline='') as text_handle:
+                        frame.to_csv(text_handle, index=False)
+        else:
+            frame.to_csv(temporary, index=False)
+        if checksum_tmp is not None:
+            digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
+            checksum_tmp.write_text(f'{digest}  {destination.name}\n', encoding='ascii')
+        _assert_inputs_unchanged(input_identities)
+        if checksum_path is not None:
+            checksum_path.unlink(missing_ok=True)
 
 
-def merge_barcodes(input_files, samples, template, locus, output, *, configfile=None, checksum_output=None):
+def merge_barcodes(input_files, samples, template, locus, output, *, configfile, checksum_output=None):
     """Merge one locus and attach auditable cross-sample recurrence evidence.
 
     Evidence is first deduplicated within one physical source, then raw DARLIN
@@ -1067,25 +1100,45 @@ def merge_barcodes(input_files, samples, template, locus, output, *, configfile=
     ``qc_passing_biological_sample_count``; the ungated observed count is kept
     separately for audit.
     """
-    _load_runtime_deps()
+    if configfile is None:
+        raise ValueError('merge-barcodes requires the current project configfile')
+    input_identities = {Path(path).expanduser():stable_file_identity(Path(path).expanduser())
+                        for path in [*input_files, configfile]}
+    raw_config = _read_yaml(configfile)
+    raw_config['__configfile__'] = str(Path(configfile).expanduser().resolve())
+    manifest = _resolve_project_path(raw_config.get('sample_manifest', '00_config/sample_manifest.tsv'), _project_dir(raw_config))
+    input_identities[manifest] = stable_file_identity(manifest)
+    validate_file_outputs([*input_files, configfile, manifest],
+                          [output, *([checksum_output] if checksum_output is not None else [])])
     if len(input_files) != len(samples):
         raise ValueError('--input-files and --samples must have the same length')
-    clone_config = _clone_config(_read_yaml(configfile))
+    source_roles = darlin_source_roles(read_manifest(manifest)[1],
+                                      include_rna=raw_config.get('DARLIN', {}).get('include_rna_fastq', False))
+    unknown = set(samples).difference(source_roles)
+    if unknown:
+        raise ValueError(f'DARLIN sources are not declared by the current manifest/roles: {sorted(unknown)}')
+    clone_config = _clone_config(raw_config)
     qc = clone_config['qc']
     extraction = clone_config['extraction']
     frames = []
     for sample, path in zip(samples, input_files, strict=True):
         df = _read_table(path)
+        if (not {'source_identity_contract', 'source_type'}.issubset(df)
+                or not df['source_identity_contract'].eq(DARLIN_SOURCE_CONTRACT).all()
+                or not df['source_type'].eq(source_roles[sample][1]).all()):
+            raise ValueError(f'{path}: rerun extract-barcodes-multi for the declared source role; source metadata missing or invalid')
         payload_columns = [column for column in BARCODE_COLUMNS if column in df.columns]
         required = {'cell_id', 'clone_id', 'read', 'umi_count'}
         missing = sorted(required.difference(df.columns))
         if missing:
             raise ValueError(f'{path} is missing required column(s): {missing}')
         df['source_sample'] = sample
-        df[BIOLOGICAL_SOURCE_COLUMN] = _biological_source_sample(sample)
+        biological_sample = source_roles[sample][0]
+        df[BIOLOGICAL_SOURCE_COLUMN] = biological_sample
+        df['source_identity_contract'] = DARLIN_SOURCE_CONTRACT
         df['template'] = template
         df['locus'] = locus
-        df[CANONICAL_CELL_BARCODE_COLUMN] = df.apply(lambda row, current_sample=sample: _canonical_cell_barcode(row, current_sample), axis=1)
+        df[CANONICAL_CELL_BARCODE_COLUMN] = df.apply(lambda row, current_sample=sample: _canonical_cell_barcode(row, current_sample, biological_sample), axis=1)
         df[NORMALIZED_BARCODE_COLUMN] = df['clone_id'].map(_normalized_exact_barcode)
         df.attrs['payload_columns'] = payload_columns
         frames.append(df)
@@ -1094,13 +1147,14 @@ def merge_barcodes(input_files, samples, template, locus, output, *, configfile=
         for column in (OBSERVED_EVIDENCE_COLUMN, QC_PASSING_EVIDENCE_COLUMN, REFERENCE_EVIDENCE_COLUMN):
             merged[column] = pd.Series(dtype='Int64')
     else:
-        merged = _apply_rna_allele_catalog_rescue(merged, extraction)
+        merged = _apply_rna_allele_catalog_rescue(
+            merged, extraction, {sample for sample, (_, role) in source_roles.items() if role == 'rna_rescue'})
         payload_columns = [column for column in BARCODE_COLUMNS if column in merged.columns]
         source_candidates = _collapse_source_candidates(merged, payload_columns)
         merged = _aggregate_biological_candidates(source_candidates)
         merged = _attach_recurrence_evidence(merged, qc)
         merged = merged.sort_values([BIOLOGICAL_SOURCE_COLUMN, CANONICAL_CELL_BARCODE_COLUMN, 'locus', NORMALIZED_BARCODE_COLUMN, 'source_samples'], kind='mergesort').reset_index(drop=True)
-    _write_merged_table(merged, output, checksum_output)
+    _write_merged_table(merged, output, checksum_output, input_identities=input_identities.items())
 
 
 def _barcode_value(row):
@@ -1285,16 +1339,22 @@ def _verify_checksum_sidecar(path, checksum_path):
 
 def build_clone_table(barcode_files, templates, loci, configfile, output, *, checksum_files=None):
     """Integrate template-level barcodes into the final DARLIN clone table."""
-    _load_runtime_deps()
     if len(barcode_files) != len(templates) or len(templates) != len(loci):
         raise ValueError('barcode_files, templates, and loci must have the same length')
+    if checksum_files is not None and len(checksum_files) != len(barcode_files):
+        raise ValueError('checksum_files and barcode_files must have the same length')
+    input_identities = {Path(path).expanduser():stable_file_identity(Path(path).expanduser())
+                        for path in [*barcode_files, *(checksum_files or []), configfile]}
     if checksum_files is not None:
-        if len(checksum_files) != len(barcode_files):
-            raise ValueError('checksum_files and barcode_files must have the same length')
         for path, checksum_path in zip(barcode_files, checksum_files, strict=True):
             _verify_checksum_sidecar(path, checksum_path)
     raw_config = _read_yaml(configfile)
     raw_config['__configfile__'] = str(Path(configfile).expanduser().resolve())
+    identity_paths = [_resolve_project_path(raw_config.get(key, default), _project_dir(raw_config))
+                      for key, default in (('sample_manifest', '00_config/sample_manifest.tsv'),
+                                           ('barcode_map', '00_config/Barcode_Map.csv'))]
+    input_identities.update({path:stable_file_identity(path) for path in identity_paths})
+    validate_file_outputs([*input_identities], [output])
     config = _clone_config(raw_config)
     project_by_sample, plate_by_rna_barcode = _cell_name_maps(raw_config)
     barcode_map_path = _resolve_project_path(raw_config.get('barcode_map', '00_config/Barcode_Map.csv'), _project_dir(raw_config))
@@ -1307,6 +1367,9 @@ def build_clone_table(barcode_files, templates, loci, configfile, output, *, che
     frames = []
     for path, template, locus in zip(barcode_files, templates, loci, strict=True):
         df = _read_table(path)
+        if ('source_identity_contract' not in df
+                or not df['source_identity_contract'].eq(DARLIN_SOURCE_CONTRACT).all()):
+            raise ValueError(f'{path}: rerun merge-barcodes with the current project manifest; source identity contract missing or invalid')
         if df.empty:
             continue
         if 'cell_id' not in df.columns:
@@ -1396,8 +1459,9 @@ def build_clone_table(barcode_files, templates, loci, configfile, output, *, che
     if not final.empty:
         final = _collapse_duplicate_sample_ids(final)
         final = final.sort_values('Sample_ID').reset_index(drop=True)
-    _ensure_parent(output)
-    final.to_csv(output, index=False)
+    with atomic_output(output) as temporary:
+        final.to_csv(temporary, index=False)
+        _assert_inputs_unchanged(input_identities.items())
 
 
 def barcode_table_main(argv=None):
@@ -1408,7 +1472,7 @@ def barcode_table_main(argv=None):
     merge_parser.add_argument('--samples', nargs='+', required=True, help='Sample names matching --input-files order.')
     merge_parser.add_argument('--template', required=True, help='Template name represented by the input files.')
     merge_parser.add_argument('--locus', required=True, help='Locus label written to the merged barcode table.')
-    merge_parser.add_argument('--configfile', default=None, help='RNA_DARLIN YAML used for non-recurrence QC thresholds.')
+    merge_parser.add_argument('--configfile', required=True, help='Current project YAML for source identity and QC thresholds.')
     merge_parser.add_argument('--output', required=True, help='Merged barcode CSV path.')
     merge_parser.add_argument('--checksum-output', default=None, help='Optional SHA-256 sidecar for the persistent merged table.')
     clone_parser = subparsers.add_parser('build-clone-table', help='Build final DARLIN_Clone_ID.csv.')
@@ -1877,17 +1941,27 @@ def extract_barcodes_multi(args):
     sets for the barcode metrics and sidecar row lookup.
     """
     output_root = Path(args.output_root)
-    output_root.mkdir(parents=True, exist_ok=True)
+    templates = list(dict.fromkeys(args.template))
+    if not templates:
+        raise ValueError('At least one DARLIN template is required')
+    if not SAMPLE_ID_PATTERN.fullmatch(args.sample):
+        raise ValueError('Invalid DARLIN sample identity')
+    for template in templates:
+        _template_parts(template)
+    metrics_destination = Path(args.barcode_metrics)
+    destinations = [metrics_destination, *(output_root / template / args.sample / name
+                    for template in templates for name in ('DARLIN_Barcodes.csv', 'read_fate.tsv.gz'))]
+    input_paths = [Path(path) for path in (args.fastq_r1, args.fastq_r2, args.cell_barcode_whitelist)]
+    validate_file_outputs(input_paths, destinations)
+    input_states = {path: file_stat_identity(path) for path in input_paths}
     parent = project_temporary_parent(Path(args.work_dir) / 'stream')
     parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='.darlin-stream.', dir=parent) as temporary:
+    with tempfile.TemporaryDirectory(prefix='.darlin-stream.', dir=parent) as temporary, ExitStack() as commits:
+        candidates_by_destination = {path: commits.enter_context(atomic_output(path)) for path in destinations}
         work_dir = Path(temporary)
         fastq_dir = _prepare_fastq_dir(args.fastq_r1, args.fastq_r2, args.sample, work_dir)
         ref_barcodes = _load_cell_barcode_whitelist(args.cell_barcode_whitelist, args.cell_barcode_length)
         barcode_index = _build_unique_hamming1_barcode_index(ref_barcodes)
-        templates = list(dict.fromkeys(args.template))
-        if not templates:
-            raise ValueError('At least one DARLIN template is required')
 
         inventory_path = work_dir / 'read_ids.txt.gz'
         candidate_streams = {}
@@ -1981,9 +2055,8 @@ def extract_barcodes_multi(args):
         dual_anchor_ordinal_arrays = {}
         for template in templates:
             template_started = time.time()
-            output = output_root / template / args.sample / 'DARLIN_Barcodes.csv'
-            sidecar = output_root / template / args.sample / 'read_fate.tsv.gz'
-            output.parent.mkdir(parents=True, exist_ok=True)
+            output = candidates_by_destination[output_root / template / args.sample / 'DARLIN_Barcodes.csv']
+            sidecar = candidates_by_destination[output_root / template / args.sample / 'read_fate.tsv.gz']
             filtered = _combine_streamed_darlin_candidates(filtered_chunks[template])
             # UMI-level allele consensus runs before the read cutoff so sequencing-error
             # variants of one molecule jointly support that molecule (documented
@@ -2010,6 +2083,8 @@ def extract_barcodes_multi(args):
             if final.empty:
                 _write_empty_output(output, pd)
             else:
+                final['source_type'] = args.source_type
+                final['source_identity_contract'] = DARLIN_SOURCE_CONTRACT
                 final.to_csv(output, index=False)
             _write_read_fate_sidecar(sidecar, template, inventory_path, total_reads, candidates, final, clone_lineage=lineage)
             print(
@@ -2024,20 +2099,23 @@ def extract_barcodes_multi(args):
 
         candidate_ordinal_union = np.unique(np.concatenate(list(candidate_ordinal_arrays.values()))) if candidate_ordinal_arrays else np.empty(0, dtype=np.int64)
         dual_anchor_ordinal_union = np.unique(np.concatenate(list(dual_anchor_ordinal_arrays.values()))) if dual_anchor_ordinal_arrays else np.empty(0, dtype=np.int64)
-        metrics_path = Path(args.barcode_metrics)
-        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_path = candidates_by_destination[metrics_destination]
         accepted = correction_counts['exact'] + correction_counts['corrected_hamming1']
         with metrics_path.open('w', encoding='utf-8', newline='') as handle:
             writer = csv.writer(handle, delimiter='\t', lineterminator='\n')
-            writer.writerow(['sample', 'source_type', 'total_reads', 'exact_barcode_reads', 'corrected_hamming1_reads', 'ambiguous_barcode_reads', 'unmatched_barcode_reads', 'accepted_barcode_reads', 'accepted_fraction', 'correction_fraction_of_accepted', 'darlin_candidate_reads_any_template', 'dual_anchor_reads_any_template'])
+            writer.writerow(['sample', 'source_type', 'total_reads', 'exact_barcode_reads', 'corrected_hamming1_reads', 'ambiguous_barcode_reads', 'unmatched_barcode_reads', 'accepted_barcode_reads', 'accepted_fraction', 'correction_fraction_of_accepted', 'darlin_candidate_reads_any_template', 'dual_anchor_reads_any_template', 'source_identity_contract'])
             writer.writerow([
-                args.sample, 'rna_rescue' if str(args.sample).endswith('__RNA') else 'targeted',
+                args.sample, args.source_type,
                 total_reads, correction_counts['exact'], correction_counts['corrected_hamming1'],
                 correction_counts['ambiguous'], correction_counts['unmatched'], accepted,
                 f'{accepted / total_reads if total_reads else 0.0:.8f}',
                 f'{correction_counts["corrected_hamming1"] / accepted if accepted else 0.0:.8f}',
                 int(candidate_ordinal_union.size), int(dual_anchor_ordinal_union.size),
+                DARLIN_SOURCE_CONTRACT,
             ])
+        assert_file_states_unchanged(input_states)
+        # 模板表及sidecar全部就绪才开始替换；撤旧证据后由最外层最后提交metrics。
+        metrics_destination.unlink(missing_ok=True)
 
 
 
@@ -2066,6 +2144,8 @@ def _peak_rss_mb():
 def extract_barcodes_multi_main(argv=None):
     parser = argparse.ArgumentParser(description='Single-pass multi-template DARLIN extraction.')
     parser.add_argument('--sample', required=True)
+    parser.add_argument('--source-type', choices=('targeted', 'rna_rescue'), required=True,
+                        help='Internal source role supplied by the workflow.')
     parser.add_argument('--template', action='append', required=True, help='Repeat for each DARLIN template.')
     parser.add_argument('--fastq-r1', required=True)
     parser.add_argument('--fastq-r2', required=True)

@@ -7,14 +7,43 @@ import threading
 from contextlib import ExitStack, contextmanager
 
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import pandas as pd
 from .config import DownstreamQCError
-from ..io import atomic_output
+from ..io import atomic_output, file_stat_identity, stable_file_identity
 
 
+def human_annotation_reference_identity(pipeline_root: Path, census_version: str):
+    """按角色记录持久SHA与本次读取状态，不导入注释计算依赖。"""
+    root = Path(pipeline_root)
+    relative = Path('resources/hg38_reference')
+    model = relative / f'census_{census_version}_scvi'
+    paths = dict(model=model/'model.pt', gene_map=model/'census_gene_map.npz',
+                 embedding=model/f'census_{census_version}_scvi_reference.npz',
+                 seal=model/'census_reference.json', ontology=relative/'cell_ontology/cl-basic.obo')
+    states = {root/path: file_stat_identity(root/path) for path in paths.values()}
+    identity = {}
+    for role, relative_path in paths.items():
+        path = root/relative_path
+        digest, state = stable_file_identity(path)
+        if state != states[path]:
+            raise DownstreamQCError(f'Human annotation reference changed while recording identity: {path}')
+        identity[role] = {'path': relative_path.as_posix(), 'sha256': digest}
+    if any(file_stat_identity(path) != state for path, state in states.items()):
+        raise DownstreamQCError('Human annotation reference changed while recording identity')
+    return identity, states
+
+
+
+
+def read_verified_qc_csv(path: Path, expected_sha256: str | None, **options) -> pd.DataFrame:
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise DownstreamQCError(f'整合 QC 文件缺少有效哈希：{path.name}，请重新运行分析')
+    return pd.read_csv(io.BytesIO(data), keep_default_na=False, **options)
 
 
 def atomic_write_bytes(data: bytes, destination: Path) -> None:
@@ -85,21 +114,16 @@ def atomic_write_h5ad(adata, destination: Path) -> None:
 
 
 def downstream_source_sha256() -> str:
-    """绑定完整下游Processor及实际消费的核心配置/IO/路径源码，不执行被读取源码。"""
-    root = Path(__file__).resolve().parent
-    core = root.parent
-    paths = [path for path in sorted(root.rglob("*.py"))
-             if not any(part in {"__pycache__", ".ipynb_checkpoints"} for part in path.relative_to(root).parts)]
-    paths += [core / name for name in ("config.py", "io.py", "paths.py")]
-    digest = hashlib.sha256()
-    for path in sorted(paths):
-        relative = path.relative_to(core).as_posix().encode()
-        data = path.read_bytes()
-        digest.update(len(relative).to_bytes(4, "big"))
-        digest.update(relative)
-        digest.update(len(data).to_bytes(8, "big"))
-        digest.update(data)
-    return digest.hexdigest()
+    """不能用升级后的磁盘哈希为旧内核中的科学逻辑签名。"""
+    from .. import _downstream_source_identity, _IMPORTED_DOWNSTREAM_SOURCE_IDENTITY
+
+    try:
+        current = _downstream_source_identity()
+    except RuntimeError as error:
+        raise DownstreamQCError(str(error)) from error
+    if current != _IMPORTED_DOWNSTREAM_SOURCE_IDENTITY:
+        raise DownstreamQCError('Lemmus scientific source changed after import; restart the kernel or use a fresh process')
+    return current[0]
 
 
 _WRITE_GUARD = threading.Lock()

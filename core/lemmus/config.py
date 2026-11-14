@@ -14,6 +14,9 @@ CONFIG_SCHEMA_VERSION = 2
 
 RNA_RESOLUTION = 'parsimony-gene'
 RNA_GENE_EC_ORDER = 'lexicographic_gene_labels_v1'
+RNA_CALLING_CONTRACT = 'prepared_pg_input_sha256_v1'
+DROPLET_PREPROCESS_MEM_MB = 8192
+DARLIN_SOURCE_CONTRACT = 'manifest_source_roles_v1'
 
 
 RRNA_COMPETITOR_ID = 'RRNA45S_COMPETITOR'
@@ -29,14 +32,43 @@ class ConfigError(ValueError):
     """Raised when a project config violates the current release contract."""
 
 
-def load_config(path: str | Path) -> dict[str, Any]:
+def read_config_mapping(path: str | Path) -> dict[str, Any]:
+    """安全解析同一份YAML；展开merge前拒绝原映射重复键，保留显式覆盖语义。"""
     config_path = Path(path).expanduser().resolve()
+
+    class UniqueKeyLoader(yaml.SafeLoader):
+        def __init__(self, stream):
+            super().__init__(stream)
+            self.checked_mappings = set()
+
+        def flatten_mapping(self, node):
+            if node not in self.checked_mappings:
+                self.checked_mappings.add(node)
+                seen = set()
+                for key_node, _value in node.value:
+                    key = '<<' if key_node.tag == 'tag:yaml.org,2002:merge' else self.construct_object(key_node)
+                    try:
+                        duplicate = key in seen
+                        seen.add(key)
+                    except TypeError as exc:
+                        raise ConfigError(f'Invalid config mapping key: {config_path}:{key_node.start_mark.line + 1}') from exc
+                    if duplicate:
+                        raise ConfigError(f'Duplicate config key {key!r}: {config_path}:{key_node.start_mark.line + 1}')
+            return super().flatten_mapping(node)
+
     try:
-        payload = yaml.safe_load(config_path.read_text(encoding='utf-8')) or {}
+        payload = yaml.load(config_path.read_text(encoding='utf-8'), Loader=UniqueKeyLoader)
     except (OSError, yaml.YAMLError) as exc:
         raise ConfigError(f'Cannot read project config {config_path}: {exc}') from exc
+    if payload is None:
+        payload = {}
     if not isinstance(payload, dict):
         raise ConfigError('Project config root must be a mapping')
+    return payload
+
+
+def load_config(path: str | Path) -> dict[str, Any]:
+    payload = read_config_mapping(path)
     validate_config(payload)
     return select_config(payload)
 
@@ -184,7 +216,7 @@ def resolve_project_config(path: str | Path) -> tuple[Path, Path, dict[str, Any]
 MANIFEST_FIELDS = ('sample_id', 'rna_sample', 'darlin_sample', 'species', 'notes')
 
 
-SAMPLE_ID_PATTERN = re.compile('^[A-Za-z0-9_.-]+$')
+SAMPLE_ID_PATTERN = re.compile(r'^(?!\.{1,2}$)[A-Za-z0-9_.-]+$')
 
 
 @dataclass(frozen=True)
@@ -260,7 +292,7 @@ slurm:
 # ===== Cabernet: R1=cDNA; R2=CB8/10+UMI8 =====
 # Only active when pipeline_mode: cabernet. RNA-only: set cabernet.DARLIN.enabled=false.
 cabernet:
-  barcode_map: 00_config/Barcode_Map.csv  # 与 Alopex Cabernet 共享 PlateID/RNA_Barcode/Cell_Order；DNA 外部关联填写 RNA raw basename
+  barcode_map: 00_config/Barcode_Map.csv  # 与 Alopex Cabernet 共享 PlateID/Cell_Order，各自使用本模态条码；DNA 外部关联填写 RNA raw basename
   RNA:
     reference: mm10
     cores: 16
@@ -310,7 +342,7 @@ droplet:  # 对应 Alopex analysis.protocol: droplet；共享 ME5 设计，DNA/R
   RNA:
     reference: hg38
     cores: 16
-    # quant_threads: 16  # Optional explicit quant budget; default = cores, 1..cores.
+    # quant_threads: 16  # Optional explicit quant budget; default = cores, 2..cores.
     mem_mb: 49152
     runtime: 720
 """
@@ -346,8 +378,8 @@ properties:
     required: [reference, cores]
     properties:
       reference: {type: string, minLength: 1}
-      cores: {type: integer, minimum: 1}
-      quant_threads: {type: integer, minimum: 1}
+      cores: {type: integer, minimum: 2}
+      quant_threads: {type: integer, minimum: 2}
       mem_mb: {type: integer, minimum: 1}
       runtime: {type: integer, minimum: 1}
       min_reads: {type: integer, minimum: 1}
@@ -453,6 +485,7 @@ def config_scalars_main(argv=None):
         "JOBS": slurm["jobs"],
         "PIPELINE_MODE": cfg['pipeline_mode'],
         "RNA_MEM_MB": cfg['RNA'].get('mem_mb', 16384),
+        "DROPLET_PREPROCESS_MEM_MB": DROPLET_PREPROCESS_MEM_MB,
         "RNA_CORES": cfg["RNA"]["cores"],
         "LOCAL_CORES": slurm["local_cores"],
         "LATENCY": slurm["latency_wait"],

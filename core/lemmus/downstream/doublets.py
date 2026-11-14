@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 import pandas as pd
@@ -23,8 +24,10 @@ from .integration import (
     validate_droplet_integration_links,
 )
 from ..io import project_temporary_parent
+from ..inputs import read_manifest
 from .io import (
     write_lock,
+    read_verified_qc_csv,
     atomic_write_csv,
     atomic_write_h5ad,
     atomic_write_json,
@@ -44,20 +47,24 @@ def score_droplet_doublets(adata, *, expected_doublet_rate=0.05, random_state=0,
     """逐文库运行 Scrublet，以自动阈值乘倍率判定；降低倍率会增加剔除，失败不得伪装成 singlet。"""
     import numpy as np
     import scanpy as sc
+    from ..rna import validate_rna_count_matrix
     if not math.isfinite(expected_doublet_rate) or not 0 < expected_doublet_rate < 1:
         raise DownstreamQCError('expected_doublet_rate must be finite and between 0 and 1')
     if not math.isfinite(doublet_threshold_scale) or not 0 < doublet_threshold_scale <= 1:
         raise DownstreamQCError('doublet_threshold_scale must be finite and in (0, 1]')
     if not adata.obs_names.is_unique:
         raise DownstreamQCError('Duplicate RNA cell IDs')
+    try:
+        validate_rna_count_matrix(adata.X)
+    except ValueError as error:
+        raise DownstreamQCError(f'Scrublet requires finite nonnegative integer raw counts: {error}') from error
     records, libraries = [], {}
     for library in sorted(adata.obs['sample_id'].unique()):
         subset = adata[adata.obs['sample_id'].eq(library)].copy()
-        values = subset.X.data if hasattr(subset.X, 'tocsr') else np.asarray(subset.X)
-        if not np.isfinite(values).all() or (values < 0).any():
-            raise DownstreamQCError(f'{library}: Scrublet requires finite nonnegative raw counts')
         if subset.n_obs <= 30 or subset.n_vars <= 30:
             raise DownstreamQCError(f'{library}: 数据不足以运行 30-PC Scrublet；不自动判为 singlet')
+        subset.obs.drop(columns=['doublet_score', 'predicted_doublet'], errors='ignore', inplace=True)
+        subset.uns.pop('scrublet', None)
         try:
             sc.pp.scrublet(subset, expected_doublet_rate=expected_doublet_rate,
                            random_state=random_state, n_prin_comps=30,
@@ -69,9 +76,10 @@ def score_droplet_doublets(adata, *, expected_doublet_rate=0.05, random_state=0,
         scores = subset.obs['doublet_score']
         labels = subset.obs['predicted_doublet']
         threshold = subset.uns.get('scrublet', {}).get('threshold')
-        if threshold is None or not np.isfinite(threshold) or not np.isfinite(scores).all() or labels.isna().any():
+        if (threshold is None or not np.isfinite(threshold) or scores.dtype.kind not in 'iuf'
+                or not scores.between(0, 1).fillna(False).all() or labels.isna().any()):
             raise DownstreamQCError(f'{library}: Scrublet 分数或自动阈值无效；不把未判定细胞当 singlet')
-        if not labels.isin([True, False]).all():
+        if not pd.api.types.is_bool_dtype(labels.dtype):
             raise DownstreamQCError(f'{library}: Scrublet 返回非布尔判定')
         auto_threshold = float(threshold)
         if auto_threshold <= 0:
@@ -90,12 +98,23 @@ def score_droplet_doublets(adata, *, expected_doublet_rate=0.05, random_state=0,
     return result, libraries
 
 
+def _droplet_rna_libraries(rna_root: Path) -> pd.DataFrame:
+    from lemmus.config import load_config
+
+    config = load_config(rna_root / '00_config/config.yaml')
+    if config.get('pipeline_mode') != 'droplet':
+        raise DownstreamQCError('此入口只接受 Droplet RNA 项目')
+    manifest_path = Path(config.get('sample_manifest', '00_config/sample_manifest.tsv')).expanduser()
+    fields, rows = read_manifest(rna_root / manifest_path)
+    manifest = pd.DataFrame(rows, columns=fields)
+    return manifest.loc[manifest.rna_sample.ne(''), ['sample_id', 'rna_sample']]
+
+
 def run_droplet_qc_integration(rna_project_root, dna_project_root, *, expected_doublet_rate=0.05, random_state=0,
                               doublet_threshold_scale=1.0):
     """仅整合 Droplet QC、预测并去除 RNA doublet，发布 raw-count singlet AnnData。"""
     import importlib.metadata
     import numpy as np
-    from lemmus.config import load_config
 
     roots = []
     for value in (rna_project_root, dna_project_root):
@@ -103,14 +122,11 @@ def run_droplet_qc_integration(rna_project_root, dna_project_root, *, expected_d
             raise DownstreamQCError('请填写 RNA_PROJECT_ROOT 和 DNA_PROJECT_ROOT 两个项目目录')
         roots.append(Path(value).expanduser().resolve())
     rna_root, dna_root = roots
-    config = load_config(rna_root / '00_config/config.yaml')
-    if config.get('pipeline_mode') != 'droplet':
-        raise DownstreamQCError('此入口只接受 Droplet RNA 项目')
-    full, _ = build_rna_qc_table(rna_root)
+    snapshot = _qc_snapshot_id(rna_root)
+    selected = _droplet_rna_libraries(rna_root)
+    full, rna_inputs = build_rna_qc_table(rna_root)
     if 'protocol' not in full or not full.protocol.eq('droplet').all():
         raise DownstreamQCError('RNA.h5ad 必须包含 finalized Droplet 身份')
-    manifest = pd.read_csv(rna_root / '00_config/sample_manifest.tsv', sep='\t', dtype=str, keep_default_na=False)
-    selected = manifest.loc[manifest.rna_sample.ne(''), ['sample_id', 'rna_sample']]
     observed = full[['sample_id', 'rna_sample']].drop_duplicates()
     if (any(selected[c].duplicated().any() for c in selected)
             or set(map(tuple, selected.to_numpy())) != set(map(tuple, observed.to_numpy()))):
@@ -120,8 +136,7 @@ def run_droplet_qc_integration(rna_project_root, dna_project_root, *, expected_d
             'sample_id 是项目样本名，rna_sample 是原始 FASTQ 文库名；须与已完成结果保持一致。')
     if not full.Sample_ID.eq(full.sample_id.astype(str) + '_' + full.RNA_Barcode.astype(str)).all():
         raise DownstreamQCError('RNA cell ID 与 finalized sample_id/barcode 不一致')
-    dna, dm = load_dna_qc(dna_root)
-    snapshot = _qc_snapshot_id(rna_root)
+    dna, dm = load_dna_qc(dna_root, expected_reference=rna_inputs['rna_reference'])
     adata = load_rna_matrix(rna_root)
     compute_rna_qc(adata, validate_analysis_params(None))
     full['pct_counts_mt'] = full.Sample_ID.map(adata.obs['pct_counts_mt'])
@@ -162,20 +177,26 @@ def run_droplet_qc_integration(rna_project_root, dna_project_root, *, expected_d
                   'versions': versions, 'processor_sha256': downstream_source_sha256()}
     out = rna_root / '06_downstream' / 'droplet_integration'
     singlets.uns['droplet_qc_integration'] = json.dumps(provenance, sort_keys=True)
-    if _qc_snapshot_id(rna_root) != snapshot or sha256_file(dna_root / '03_results/run_manifest.json') != provenance['dna']['run_manifest_sha256']:
-        raise DownstreamQCError('DNA/RNA 输入在分析期间改变，请重试')
-    if sha256_file(Path(provenance['dna']['qc_path'])) != provenance['dna']['qc_sha256']:
-        raise DownstreamQCError('DNA QC 在分析期间改变，请重试')
+    def check_inputs(message):
+        if _qc_snapshot_id(rna_root) != snapshot:
+            raise DownstreamQCError(message)
+        current, _ = load_dna_qc(dna_root, expected_reference=rna_inputs['rna_reference'])
+        if current.attrs['dna_provenance'] != provenance['dna']:
+            raise DownstreamQCError(message)
+
     out.mkdir(parents=True, exist_ok=True)
     with write_lock(out):
-        # 下游判定和导出都先锁整合目录，固定路径覆盖不会与旧输入读写交叉。
-        if (out/'plots').is_symlink():
-            raise DownstreamQCError(f'QC plots directory must not be a symlink: {out}')
+        # 输出锁不保护DNA项目；覆盖旧产物前与发布摘要前均复核完整身份。
+        check_inputs('DNA/RNA 输入在分析期间改变，请重试')
+        child = out / 'dna_doublet'
+        plots = out / 'plots'
+        for directory, label in ((child, 'DNA doublet'), (plots, 'QC plots')):
+            if directory.is_symlink():
+                raise DownstreamQCError(f'{label} directory must not be a symlink: {directory}')
+            if directory.exists() and not directory.is_dir():
+                raise DownstreamQCError(f'{label} path is not a directory: {directory}')
         marker = out / 'integration_summary.json'
         marker.unlink(missing_ok=True)
-        child = out / 'dna_doublet'
-        if child.is_symlink():
-            raise DownstreamQCError(f'DNA doublet directory must not be a symlink: {child}')
         for directory, names in (
             (out, ('SingleCpG_Adata.h5ad',)),
             (child, ('DNA_doublet_summary.json', 'DNA_doublet_scores.csv', 'SingleCpG_Adata.h5ad')),
@@ -184,7 +205,7 @@ def run_droplet_qc_integration(rna_project_root, dna_project_root, *, expected_d
                 (directory / name).unlink(missing_ok=True)
         for stem in ('01_membership_doublets', '02_joint_qc_doublets', '03_singlet_qc'):
             for suffix in ('.pdf', '.png'):
-                (out/'plots'/f'{stem}{suffix}').unlink(missing_ok=True)
+                (plots/f'{stem}{suffix}').unlink(missing_ok=True)
         atomic_write_csv(doublets, out / 'RNA_doublet_scores.csv')
         atomic_write_csv(ledger, out / 'DNA_RNA_cell_links.csv')
         atomic_write_csv(integrated, out / 'Integrated_QC_Information.csv')
@@ -194,11 +215,9 @@ def run_droplet_qc_integration(rna_project_root, dna_project_root, *, expected_d
                    'integrated_cells': len(integrated), 'integrated_doublets': int(integrated.predicted_doublet.sum()),
                    'singlet_cells': singlets.n_obs, 'generated_at_utc': datetime.now(timezone.utc).isoformat(),
                    'qc_artifacts': {name: sha256_file(out / name) for name in (
-                       'Integrated_QC_Information.csv', 'DNA_RNA_cell_links.csv')}}
-        current, _ = load_dna_qc(dna_root)
-        if (_qc_snapshot_id(rna_root) != snapshot
-                or current.attrs['dna_provenance'] != provenance['dna']):
-            raise DownstreamQCError('DNA/RNA 输入在写入期间改变；本次整合未完成，请重试')
+                       'Integrated_QC_Information.csv', 'DNA_RNA_cell_links.csv', 'RNA_doublet_scores.csv',
+                       'Integrated_QC_singlets.csv', 'RNA_DNA_singlets.h5ad')}}
+        check_inputs('DNA/RNA 输入在写入期间改变；本次整合未完成，请重试')
         atomic_write_json(summary, marker)
         print(f'QC 整合 {len(integrated)} cells → {singlets.n_obs} singlets；输出：{out}')
         return out
@@ -212,18 +231,21 @@ def _dna_doublet_input(dna):
     provenance = dna.attrs['dna_provenance']
     source = Path(provenance['qc_path']).parent / 'RawAdata.h5ad'
     sidecar = source.with_name('RawAdata.input_schema.json')
-    payload = json.loads(sidecar.read_bytes())
+    sidecar_bytes = sidecar.read_bytes()
+    payload = json.loads(sidecar_bytes)
+    generation = provenance.get('raw_generation')
+    if not isinstance(generation, str) or not generation or payload.get('generation_id') != generation:
+        raise DownstreamQCError('RawAdata 代际与当前 DNA QC 完成凭证不一致')
     coordinate_base = payload.get('cpg_coordinate_base')
     stat = source.stat()
     signature = dict(device=stat.st_dev, inode=stat.st_ino, mtime_ns=stat.st_mtime_ns,
                      name=source.name, size=stat.st_size)
-    if (payload.get('schema_version') != 5
+    if (payload.get('schema_version') != 6
             or type(coordinate_base) is not int or coordinate_base not in (0, 1)
             or payload.get('cpg_header') != 'chrom\tpos\tmethyl\tunmethyl'
             or payload.get('delivery_id') != provenance['delivery_id']
             or payload.get('snapshot_id') != provenance['delivery_id']
             or payload.get('h5ad') != signature
-            or not payload.get('generation_id')
             or len(payload.get('sample_ids', [])) != len(dna)
             or set(payload['sample_ids']) != set(dna.Sample_ID)):
         raise DownstreamQCError('RawAdata 计数未绑定当前 DNA 交付/细胞集合，请运行同代 DNA downstream')
@@ -243,7 +265,13 @@ def _dna_doublet_input(dna):
                            for start in range(0, int(length), 1000000))
     if len(regions) < 2:
         raise DownstreamQCError('RawAdata reference 未提供足够的 chr1–chr22 常染色体区域')
-    identity = dict(source=str(source), source_identity=signature, sidecar_sha256=sha256_file(sidecar),
+    after = source.stat()
+    if (any(getattr(stat, key) != getattr(after, key) for key in (
+            'st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns'))
+            or sidecar.read_bytes() != sidecar_bytes):
+        raise DownstreamQCError('RawAdata or its schema changed while reading DNA doublet inputs; retry')
+    identity = dict(source=str(source), source_identity=signature,
+                    sidecar_sha256=hashlib.sha256(sidecar_bytes).hexdigest(),
                     cpg_coordinate_base=coordinate_base,
                     generation_id=payload['generation_id'], delivery_id=provenance['delivery_id'],
                     regions_sha256=hashlib.sha256('\n'.join(regions).encode()).hexdigest(), n_regions=len(regions))
@@ -329,10 +357,11 @@ def run_dna_doublet_analysis(result_dir, dna_project_root, *, expected_doublet_r
     marker_bytes = marker.read_bytes()
     integration = json.loads(marker_bytes)
     dna, dna_manifest = load_dna_qc(dna_root)
-    validate_droplet_integration_links(integration, dna_manifest)
+    rna_root = Path(integration['rna_project'])
+    validate_droplet_integration_links(integration, dna_manifest, _droplet_rna_libraries(rna_root))
     if integration['dna'] != dna.attrs['dna_provenance']:
         raise DownstreamQCError('RNA 整合与当前 DNA 交付不一致')
-    if _qc_snapshot_id(Path(integration['rna_project'])) != integration['rna_qc_snapshot_id']:
+    if _qc_snapshot_id(rna_root) != integration['rna_qc_snapshot_id']:
         raise DownstreamQCError('RNA 结果已改变，请重新运行整合')
     identity, ids, regions = _dna_doublet_input(dna)
     ledger_path = parent / 'DNA_RNA_cell_links.csv'
@@ -351,16 +380,39 @@ def run_dna_doublet_analysis(result_dir, dna_project_root, *, expected_doublet_r
                       decision='DNA_doublet_score > auto_threshold * doublet_threshold_scale',
                       selection='all DNA cells; marks only; RNA singlet filter unchanged',
                       versions=versions, processor_sha256=downstream_source_sha256())
+
+    def check_inputs():
+        if (_dna_doublet_input(dna)[0] != identity
+                or marker.read_bytes() != marker_bytes
+                or _qc_snapshot_id(rna_root) != integration['rna_qc_snapshot_id']
+                or sha256_file(ledger_path) != integration['qc_artifacts']['DNA_RNA_cell_links.csv']):
+            raise DownstreamQCError('DNA doublet 输入在分析期间改变，拒绝发布或复用')
+        current, _ = load_dna_qc(dna_root)
+        if current.attrs['dna_provenance'] != integration['dna']:
+            raise DownstreamQCError('DNA doublet 当前交付/QC已改变，拒绝发布或复用')
+
     out = parent / 'dna_doublet'
     out.mkdir(parents=True, exist_ok=True)
     with write_lock(parent), write_lock(out):
         completed = out / 'DNA_doublet_summary.json'
         if completed.is_file():
             saved = json.loads(completed.read_bytes())
-            if all(saved.get(key) == value for key, value in provenance.items()) and all(
-                    sha256_file(out / name) == digest for name, digest in saved.get('artifacts', {}).items()
-                    ) and set(saved.get('artifacts', {})) == {'DNA_doublet_scores.csv'}:
-                return out
+            artifacts = saved.get('artifacts', {})
+            if (all(saved.get(key) == value for key, value in provenance.items())
+                    and isinstance(artifacts, dict) and set(artifacts) == {'DNA_doublet_scores.csv'}):
+                score_path = out/'DNA_doublet_scores.csv'
+                try:
+                    state = score_path.stat()
+                    matches = sha256_file(score_path) == artifacts[score_path.name]
+                except FileNotFoundError:
+                    matches = False
+                if matches:
+                    check_inputs()
+                    after = score_path.stat()
+                    if any(getattr(state, key) != getattr(after, key) for key in (
+                            'st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')):
+                        raise DownstreamQCError('Cached DNA doublet scores changed during reuse; retry')
+                    return out
         print(f'DNA doublet：汇总 {len(ids)} cells × {len(regions)} 常染色体 1Mb 区域的 mc/cov', flush=True)
         raw = snap.read(identity['source'], backed='r')
         try:
@@ -377,7 +429,9 @@ def run_dna_doublet_analysis(result_dir, dna_project_root, *, expected_doublet_r
         identities = dna.set_index('Sample_ID').loc[ids].rename_axis('Sample_ID').reset_index()
         scores, libraries = score_dna_doublets(*counts, identities, expected_doublet_rate=expected_doublet_rate,
                                              random_state=random_state, doublet_threshold_scale=doublet_threshold_scale)
-        links = pd.read_csv(ledger_path, dtype=str, keep_default_na=False).set_index('dna_cell_id')
+        links = read_verified_qc_csv(
+            ledger_path, integration['qc_artifacts'][ledger_path.name], dtype=str,
+        ).set_index('dna_cell_id')
         links = links.loc[links.index != '']
         if not links.index.is_unique or not set(ids).issubset(links.index):
             raise DownstreamQCError('DNA/RNA 对应表缺少 DNA 细胞或身份重复')
@@ -386,12 +440,7 @@ def run_dna_doublet_analysis(result_dir, dna_project_root, *, expected_doublet_r
             raise DownstreamQCError('RNA doublet 判定无效')
         scores['RNA_predicted_doublet'] = pd.array(rna_labels.map({'True': True, 'False': False}), dtype='boolean')
         scores['joint_predicted_doublet'] = scores.DNA_predicted_doublet | scores.RNA_predicted_doublet
-        current, _ = load_dna_qc(dna_root)
-        if (current.attrs['dna_provenance'] != integration['dna'] or _dna_doublet_input(current)[0] != identity
-                or marker.read_bytes() != marker_bytes
-                or _qc_snapshot_id(Path(integration['rna_project'])) != integration['rna_qc_snapshot_id']
-                or sha256_file(ledger_path) != integration['qc_artifacts']['DNA_RNA_cell_links.csv']):
-            raise DownstreamQCError('DNA doublet 输入在分析期间改变，拒绝发布')
+        check_inputs()
         out.mkdir(parents=True, exist_ok=True)
         completed.unlink(missing_ok=True)
         (out / 'SingleCpG_Adata.h5ad').unlink(missing_ok=True)
@@ -402,6 +451,7 @@ def run_dna_doublet_analysis(result_dir, dna_project_root, *, expected_doublet_r
                        joint_doublets=int(scores.joint_predicted_doublet.sum()),
                        generated_at_utc=datetime.now(timezone.utc).isoformat(),
                        artifacts={'DNA_doublet_scores.csv': sha256_file(out / 'DNA_doublet_scores.csv')})
+        check_inputs()
         atomic_write_json(summary, completed)
         return out
 
@@ -421,11 +471,11 @@ def export_droplet_single_cpg(result_dir, dna_project_root, *, dna_doublet_resul
     marker_bytes = marker.read_bytes()
     summary = json.loads(marker_bytes)
     dna, dna_manifest = load_dna_qc(dna_root)
-    validate_droplet_integration_links(summary, dna_manifest)
+    rna_root = Path(summary['rna_project'])
+    validate_droplet_integration_links(summary, dna_manifest, _droplet_rna_libraries(rna_root))
     provenance = dna.attrs['dna_provenance']
     if summary['dna'] != provenance:
         raise DownstreamQCError('整合结果与当前 DNA 交付/QC 不一致，请重新运行整合')
-    rna_root = Path(summary['rna_project'])
     dna_doublet = None
     destination = out
     if dna_doublet_result_dir is not None:
@@ -439,9 +489,7 @@ def export_droplet_single_cpg(result_dir, dna_project_root, *, dna_doublet_resul
 
     def check_inputs():
         if (marker.read_bytes() != marker_bytes
-                or _qc_snapshot_id(rna_root) != summary['rna_qc_snapshot_id']
-                or sha256_file(dna_root / '03_results/run_manifest.json') != provenance['run_manifest_sha256']
-                or sha256_file(Path(provenance['qc_path'])) != provenance['qc_sha256']):
+                or _qc_snapshot_id(rna_root) != summary['rna_qc_snapshot_id']):
             raise DownstreamQCError('SingleCpG 导出输入已改变，请重新运行整合')
         for name in ('Integrated_QC_Information.csv', 'DNA_RNA_cell_links.csv'):
             expected = summary.get('qc_artifacts', {}).get(name)
@@ -453,12 +501,26 @@ def export_droplet_single_cpg(result_dir, dna_project_root, *, dna_doublet_resul
                     or sha256_file(destination / 'DNA_doublet_scores.csv')
                     != dna_doublet['artifacts']['DNA_doublet_scores.csv']):
                 raise DownstreamQCError('DNA doublet 输入/判定已改变，请重新运行 DNA 分析')
+        current, _ = load_dna_qc(dna_root)
+        if current.attrs['dna_provenance'] != provenance:
+            raise DownstreamQCError('SingleCpG 当前交付/QC已改变，请重新运行整合')
 
     check_inputs()
-    common = pd.read_csv(out / 'Integrated_QC_Information.csv',
-                         dtype={c: str for c in ('Sample_ID', 'CloneID', 'PlateID')},
-                         keep_default_na=False, float_precision='round_trip')
-    ledger = pd.read_csv(out / 'DNA_RNA_cell_links.csv', dtype=str, keep_default_na=False)
+    rna_counts = {'num_genes_expressed', 'num_genes_over_mean'}
+    rna_rates = {'mapping_rate', 'dedup_rate', 'pct_counts_mt'}
+    rna_dtypes = dict.fromkeys(RNA_QC_COLUMNS, str)
+    rna_dtypes.update(dict.fromkeys(rna_counts, 'Int64'))
+    rna_dtypes.update(dict.fromkeys(rna_rates, float))
+    artifacts = summary['qc_artifacts']
+    common = read_verified_qc_csv(
+        out / 'Integrated_QC_Information.csv', artifacts['Integrated_QC_Information.csv'],
+        dtype=rna_dtypes, na_values=dict.fromkeys(rna_counts | rna_rates, ['']), float_precision='round_trip',
+    )
+    ledger = read_verified_qc_csv(
+        out / 'DNA_RNA_cell_links.csv', artifacts['DNA_RNA_cell_links.csv'],
+        dtype=defaultdict(lambda: str, {'doublet_score': float}),
+        na_values={'doublet_score': ['']}, float_precision='round_trip',
+    )
     if not set(RNA_QC_COLUMNS).issubset(common) or common.Sample_ID.duplicated().any():
         raise DownstreamQCError('整合表缺少完整 RNA QC 或包含重复细胞')
     dna_links = ledger.loc[ledger.dna_cell_id.ne('')].set_index('dna_cell_id')
@@ -484,6 +546,9 @@ def export_droplet_single_cpg(result_dir, dna_project_root, *, dna_doublet_resul
     if (schema.get('input', {}).get('delivery_id') != provenance['delivery_id']
             or schema.get('h5ad') != signature):
         raise DownstreamQCError('SingleCpG 矩阵未绑定当前 DNA 交付或文件身份已改变')
+    generation = provenance.get('raw_generation')
+    if not isinstance(generation, str) or not generation or schema['input'].get('raw_generation') != generation:
+        raise DownstreamQCError('SingleCpG 的 RawAdata 代际与当前 DNA QC 完成凭证不一致')
     if dna_doublet is not None and (
             schema['input'].get('raw_generation') != dna_doublet['raw']['generation_id']
             or schema['input'].get('raw_h5ad') != dna_doublet['raw']['source_identity']):
@@ -496,25 +561,26 @@ def export_droplet_single_cpg(result_dir, dna_project_root, *, dna_doublet_resul
     aligned_dna = dna.set_index('Sample_ID').reindex(ids)
     for column in ('Sample_ID', 'CloneID', 'PlateID'):
         expected = pd.Series(ids, index=ids) if column == 'Sample_ID' else aligned_dna[column]
-        if column in obs and obs[column].fillna('').astype(str).tolist() != expected.tolist():
+        if column in obs and obs[column].astype(object).fillna('').astype(str).tolist() != expected.tolist():
             raise DownstreamQCError(f'SingleCpG 身份与 DNA QC 冲突：{column}')
     obs['Sample_ID'] = ids
     for column in aligned_dna:
         obs[column] = aligned_dna[column].to_numpy()
     links = dna_links.reindex(ids)
     rna = common.set_index('Sample_ID').reindex(links.rna_cell_id)
-    numeric = {'mapping_rate', 'dedup_rate', 'num_genes_expressed', 'num_genes_over_mean', 'pct_counts_mt'}
     for column in RNA_QC_COLUMNS:
-        values = pd.Series(links.rna_cell_id.to_numpy()) if column == 'Sample_ID' else rna[column].reset_index(drop=True)
-        if column in numeric:
-            values = pd.to_numeric(values.mask(values.eq('')), errors='raise')
+        values = pd.Series(links.rna_cell_id.to_numpy()) if column == 'Sample_ID' else rna[column]
+        if column in rna_counts:
+            projected = values.array
+        elif column in rna_rates:
+            projected = values.to_numpy()
         else:
-            values = pd.Categorical(values.mask(values.eq('')))
-        obs['RNA_' + column] = np.asarray(values) if column in numeric else values
+            projected = pd.Categorical(values.mask(values.eq('')))
+        obs['RNA_' + column] = projected
     for column in links:
         values = links[column].reset_index(drop=True)
         if column == 'doublet_score':
-            obs[column] = pd.to_numeric(values.mask(values.eq('')), errors='raise').to_numpy()
+            obs[column] = values.to_numpy()
         elif column in ('predicted_doublet', 'dna_qc_available', 'rna_qc_available', 'rna_qc_pass'):
             if not values.isin(['True', 'False', '']).all():
                 raise DownstreamQCError(f'对应表包含非法布尔值：{column}')
@@ -522,7 +588,11 @@ def export_droplet_single_cpg(result_dir, dna_project_root, *, dna_doublet_resul
         else:
             obs[column] = pd.Categorical(values.mask(values.eq('')))
     if dna_doublet is not None:
-        scores = pd.read_csv(destination / 'DNA_doublet_scores.csv', dtype=str, keep_default_na=False)
+        scores = read_verified_qc_csv(
+            destination / 'DNA_doublet_scores.csv', dna_doublet['artifacts']['DNA_doublet_scores.csv'],
+            dtype=defaultdict(lambda: str, {'DNA_doublet_score': float}),
+            na_values={'DNA_doublet_score': ['']}, float_precision='round_trip',
+        )
         if (not scores.Sample_ID.is_unique or set(scores.Sample_ID) != set(ids)
                 or not {'DNA_doublet_score', 'DNA_predicted_doublet', 'DNA_doublet_status',
                         'RNA_predicted_doublet', 'joint_predicted_doublet', 'CloneID'}.issubset(scores)):
@@ -538,8 +608,7 @@ def export_droplet_single_cpg(result_dir, dna_project_root, *, dna_doublet_resul
         if (not obs.RNA_predicted_doublet.equals(obs.predicted_doublet)
                 or not obs.joint_predicted_doublet.equals(obs.DNA_predicted_doublet | obs.RNA_predicted_doublet)):
             raise DownstreamQCError('DNA/RNA 联合 doublet 与独立判定不一致')
-        obs['DNA_doublet_score'] = pd.to_numeric(scores.DNA_doublet_score.mask(scores.DNA_doublet_score.eq('')),
-                                               errors='raise').to_numpy()
+        obs['DNA_doublet_score'] = scores.DNA_doublet_score.to_numpy()
         obs['DNA_doublet_status'] = pd.Categorical(scores.DNA_doublet_status)
     export_provenance = dict(source=str(source), source_identity=signature,
                              dna=provenance, integration_summary_sha256=hashlib.sha256(marker_bytes).hexdigest(),
@@ -561,12 +630,12 @@ def export_droplet_single_cpg(result_dir, dna_project_root, *, dna_doublet_resul
                 write_elem(handle, 'obs', obs)
                 write_elem(handle.require_group('uns'), 'droplet_single_cpg_export',
                            json.dumps(export_provenance, sort_keys=True))
+            check_inputs()
             after = source.stat()
             if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
                     != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
                     or schema_path.read_bytes() != schema_bytes):
                 raise DownstreamQCError('SingleCpG 输入在导出期间改变，拒绝发布')
-            check_inputs()
             os.replace(tmp, target)
         finally:
             tmp.unlink(missing_ok=True)

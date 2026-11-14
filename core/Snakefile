@@ -14,14 +14,43 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from lemmus.inputs import load_barcode_config
-from lemmus.config import validate_config,select_config
-from lemmus.inputs import map_fastq_pairs_to_manifest, read_manifest, require_fastq_pairs
-from lemmus.config import PROTOCOLS,get_protocol
+from lemmus.paths import project_results_root
+from lemmus.config import validate_config,select_config,read_config_mapping
+from lemmus.inputs import map_fastq_pairs_to_manifest, read_manifest, require_fastq_pairs, darlin_source_roles
+from lemmus.config import DROPLET_PREPROCESS_MEM_MB, PROTOCOLS,get_protocol
 from lemmus.inputs import droplet_whitelist_path
 from lemmus.native import managed_quantifier_path
+from lemmus.io import sha256_file
 from lemmus.rna import droplet_geometry
-from lemmus.rna import validate_rna_reference
-from lemmus.config import RNA_RESOLUTION as PRODUCTION_RNA_RESOLUTION, RNA_GENE_EC_ORDER
+from lemmus.rna import piscem_index_files, validate_rna_reference
+from lemmus.config import RNA_RESOLUTION as PRODUCTION_RNA_RESOLUTION, RNA_GENE_EC_ORDER, RNA_CALLING_CONTRACT, DARLIN_SOURCE_CONTRACT
+
+# Shell commands dispatch into Python modules whose contents Snakemake does
+# not inspect. Bind their consumed implementation to the existing params trigger.
+RNA_SOURCE_SHA256 = {
+    name: sha256_file(SRC_DIR / "lemmus" / name)
+    for name in ("__init__.py", "__main__.py", "rna.py", "config.py", "inputs.py", "io.py", "paths.py")
+}
+DROPLET_PREPROCESS_SOURCE_SHA256 = {
+    name: sha256_file(SRC_DIR / "lemmus" / name)
+    for name in ("__init__.py", "__main__.py", "rna_preprocess.py", "read_fate.py", "config.py", "io.py")
+}
+INPUT_SOURCE_SHA256 = {
+    name: sha256_file(SRC_DIR / "lemmus" / name)
+    for name in ("__init__.py", "__main__.py", "inputs.py", "config.py", "io.py", "paths.py")
+}
+DARLIN_SOURCE_SHA256 = {
+    name: sha256_file(SRC_DIR / "lemmus" / name)
+    for name in ("__init__.py", "__main__.py", "darlin.py", "config.py", "inputs.py", "io.py", "paths.py")
+}
+READ_FATE_SOURCE_SHA256 = {
+    name: sha256_file(SRC_DIR / "lemmus" / name)
+    for name in ("__init__.py", "__main__.py", "read_fate.py", "io.py")
+}
+REPORT_SOURCE_SHA256 = {
+    name: sha256_file(SRC_DIR / "lemmus" / name)
+    for name in ("__init__.py", "__main__.py", "reports.py", "config.py", "inputs.py", "io.py", "paths.py")
+}
 
 validate_config(config)
 config = select_config(config)
@@ -57,6 +86,8 @@ def resolve_data_dir():
 
 
 DATA_DIR = resolve_data_dir()
+# Snakemake已把YAML转成dict；从原文核对重复键，不能让框架解析绕过配置边界。
+read_config_mapping(DATA_DIR / '00_config/config.yaml')
 
 
 def as_bool(value):
@@ -138,7 +169,7 @@ READ_FATE_ENABLED = as_bool(READ_FATE_CONFIG.get("enabled", False))
 
 
 def resolve_project_path(value):
-    path = Path(value)
+    path = Path(value).expanduser()
     if not path.is_absolute():
         path = DATA_DIR / path
     return path.resolve()
@@ -146,7 +177,7 @@ def resolve_project_path(value):
 
 PATH_CONFIG = config.get("paths", {}) or {}
 WORK_ROOT = resolve_project_path(PATH_CONFIG.get("work_root", "02_work"))
-RESULTS_ROOT = resolve_project_path(PATH_CONFIG.get("results_root", "03_results"))
+RESULTS_ROOT = project_results_root(DATA_DIR,config)
 LOGS_ROOT = resolve_project_path(PATH_CONFIG.get("logs_root", "04_logs"))
 
 
@@ -154,9 +185,9 @@ def resolve_sample_manifest_path():
     raw = config.get("sample_manifest", "00_config/sample_manifest.tsv")
     raw = str(raw).strip()
     if not raw or raw.lower() in {"none", "false", "null"}:
-        raise ValueError("sample_manifest must point to 00_config/sample_manifest.tsv")
+        raise ValueError("sample_manifest must point to a nonempty project manifest path")
 
-    path = Path(raw)
+    path = Path(raw).expanduser()
     path = path if path.is_absolute() else DATA_DIR / path
     if not path.is_file():
         raise ValueError(f"Sample manifest does not exist: {path}")
@@ -393,7 +424,8 @@ rule write_rna_whitelist:
     log:
         str(LOGS_ROOT / "barcode_config" / "write_rna_whitelist.log")
     params:
-        source_flag="--design-whitelist" if IS_DROPLET else "--barcode-map"
+        source_flag="--design-whitelist" if IS_DROPLET else "--barcode-map",
+        source_sha256=INPUT_SOURCE_SHA256
     shell:
         """
         mkdir -p "$(dirname {output.whitelist:q})" "$(dirname {log:q})"
@@ -426,10 +458,11 @@ rule preprocess_droplet_rna:
         str(LOG_DIR / "{sample}.droplet_preprocess.log")
     threads: 16
     resources:
-        mem_mb=8192,
+        mem_mb=DROPLET_PREPROCESS_MEM_MB,
         runtime=RNA_RUNTIME_MIN
     params:
-        python=str(CALLING_ENV / "bin/python")
+        python=str(CALLING_ENV / "bin/python"),
+        source_sha256=DROPLET_PREPROCESS_SOURCE_SHA256
     shell:
         """
         mkdir -p "$(dirname {log:q})"
@@ -454,6 +487,8 @@ rule simpleaf_quant:
         r1=quant_r1,
         r2=quant_r2,
         whitelist=rules.write_rna_whitelist.output.whitelist,
+        piscem_index=[str(path) for path in piscem_index_files(SIMPLEAF_INDEX)],
+        simpleaf_index=str(SIMPLEAF_INDEX / "simpleaf_index.json"),
         t2g=str(SIMPLEAF_T2G),
         competitor=str(SIMPLEAF_REFERENCE / "ref" / "rrna_competitor.json")
     output:
@@ -487,6 +522,10 @@ rule simpleaf_quant:
         small_thresh="--small-thresh 0" if IS_DROPLET else "",
     shell:
         """
+        if (( {threads} < 2 )); then
+            echo "ERROR: simpleaf quant requires at least 2 execution threads; allocated {threads}" >&2
+            exit 2
+        fi
         mkdir -p {params.output_dir:q} "$(dirname {log:q})"
         ulimit -n 2048 || true
         simpleaf quant \
@@ -530,7 +569,8 @@ rule export_rna_counts:
         mem_mb=RNA_MEM_MB,
         runtime=30
     params:
-        quant_dir=lambda wildcards: str(QUANT_DIR / wildcards.sample / "af_quant")
+        quant_dir=lambda wildcards: str(QUANT_DIR / wildcards.sample / "af_quant"),
+        source_sha256=RNA_SOURCE_SHA256
     shell:
         """
         python -m lemmus export-rna-counts \
@@ -554,7 +594,8 @@ rule prepare_rna_counts:
         runtime=30
     params:
         reference=str(REFERENCE_DIR),
-        species=REFERENCE_SPECIES
+        species=REFERENCE_SPECIES,
+        source_sha256=RNA_SOURCE_SHA256
     shell:
         """
         python -m lemmus prepare-rna-counts \
@@ -581,7 +622,9 @@ rule call_droplet_rna:
         mem_mb=RNA_MEM_MB,
         runtime=RNA_RUNTIME_MIN
     params:
-        rscript=str(CALLING_ENV / "bin/Rscript")
+        rscript=str(CALLING_ENV / "bin/Rscript"),
+        calling_contract=RNA_CALLING_CONTRACT,
+        source_sha256=RNA_SOURCE_SHA256
     shell:
         """
         mkdir -p "$(dirname {log:q})"
@@ -621,7 +664,9 @@ rule finalize_rna_h5ad:
         runtime=30
     params:
         rna_sample=rna_raw_sample,
-        protocol_args=finalize_protocol_args
+        protocol_args=finalize_protocol_args,
+        calling_contract=RNA_CALLING_CONTRACT if IS_DROPLET else None,
+        source_sha256=RNA_SOURCE_SHA256
     shell:
         """
         mkdir -p "$(dirname {output.h5ad:q})" "$(dirname {log:q})"
@@ -650,7 +695,8 @@ rule prefilter_rna_darlin_fastq:
         mem_mb=4096,
         runtime=120
     params:
-        command="prefilter-rna-darlin"
+        command="prefilter-rna-darlin",
+        source_sha256={**INPUT_SOURCE_SHA256, **READ_FATE_SOURCE_SHA256}
     shell:
         """
         mkdir -p "$(dirname {output.r1:q})" "$(dirname {output.metrics:q})" "$(dirname {log:q})"
@@ -830,15 +876,9 @@ if DARLIN_ENABLED:
         DARLIN_RNA_DERIVED_SAMPLES,
     )
     DARLIN_SAMPLE_LIST = list(DARLIN_RUN_PAIRS)
+    DARLIN_SOURCE_ROLES = darlin_source_roles(SAMPLE_MANIFEST, include_rna=DARLIN_INCLUDE_RNA_FASTQ)
 
-    try:
-        CONFIGFILE_PATH = (
-            str(Path(workflow.configfiles[0]).resolve())
-            if getattr(workflow, "configfiles", None)
-            else "config.yaml"
-        )
-    except NameError:
-        CONFIGFILE_PATH = "config.yaml"
+    CONFIGFILE_PATH = str(DATA_DIR / "00_config/config.yaml")
 
     def darlin_locus_for_template(template):
         for prefix, locus in DARLIN_TEMPLATE_LOCUS.items():
@@ -854,7 +894,7 @@ if DARLIN_ENABLED:
         return _darlin_fastq
 
     def darlin_read_cutoff_for_sample(sample):
-        if str(sample).endswith("__RNA"):
+        if DARLIN_SOURCE_ROLES[sample][1] == "rna_rescue":
             return DARLIN_EXTRACTION.get("rna_rescue_read_cutoff", 1)
         read_setting = DARLIN_EXTRACTION.get("read_cutoff", 3)
         if isinstance(read_setting, str) and read_setting.lower().endswith(".csv"):
@@ -915,7 +955,10 @@ if DARLIN_ENABLED:
             seq_3prime_upper_n=str(DARLIN_EXTRACTION["seq_3prime_upper_n"]),
             seq_3prime_max_mismatches=str(DARLIN_EXTRACTION["seq_3prime_max_mismatches"]),
             min_cell_read_fraction=str(DARLIN_EXTRACTION["min_cell_read_fraction"]),
-            read_cutoff=lambda wildcards: str(darlin_read_cutoff_for_sample(wildcards.sample))
+            read_cutoff=lambda wildcards: str(darlin_read_cutoff_for_sample(wildcards.sample)),
+            source_type=lambda wildcards: DARLIN_SOURCE_ROLES[wildcards.sample][1],
+            source_sha256=DARLIN_SOURCE_SHA256,
+            source_contract=DARLIN_SOURCE_CONTRACT
         shell:
             """
             mkdir -p {params.output_root:q} "$(dirname {output.barcode_metrics:q})" "$(dirname {log:q})"
@@ -924,6 +967,7 @@ if DARLIN_ENABLED:
             {params.python:q} -m lemmus assert-fastq {input.fq_R2:q} "DARLIN R2" > /dev/null
             {params.python:q} -m lemmus extract-barcodes-multi \
                 --sample {wildcards.sample:q} \
+                --source-type {params.source_type:q} \
                 {params.template_args} \
                 --fastq-r1 {input.fq_R1:q} \
                 --fastq-r2 {input.fq_R2:q} \
@@ -945,11 +989,13 @@ if DARLIN_ENABLED:
 
     rule merge_darlin_template_barcodes:
         input:
-            lambda wildcards: expand(
+            barcodes=lambda wildcards: expand(
                 str(DARLIN_WORK_DIR / "{template}" / "{sample}" / "DARLIN_Barcodes.csv"),
                 template=[wildcards.template],
                 sample=DARLIN_SAMPLE_LIST,
-            )
+            ),
+            configfile=CONFIGFILE_PATH,
+            manifest=str(SAMPLE_MANIFEST_PATH)
         output:
             csv=str(DARLIN_WORK_DIR / "{template}" / "DARLIN_Barcodes.csv.gz"),
             checksum=str(DARLIN_WORK_DIR / "{template}" / "DARLIN_Barcodes.csv.gz.sha256")
@@ -964,16 +1010,18 @@ if DARLIN_ENABLED:
             python=DARLIN_PYTHON,
             samples=lambda wildcards: DARLIN_SAMPLE_LIST,
             locus=lambda wildcards: darlin_locus_for_template(wildcards.template),
-            configfile=CONFIGFILE_PATH
+            config_sha256=sha256_file(Path(CONFIGFILE_PATH)),
+            source_sha256=DARLIN_SOURCE_SHA256,
+            source_contract=DARLIN_SOURCE_CONTRACT
         shell:
             """
             mkdir -p "$(dirname {output.csv:q})" "$(dirname {log:q})"
             {params.python:q} -m lemmus merge-barcodes \
-                --input-files {input:q} \
+                --input-files {input.barcodes:q} \
                 --samples {params.samples:q} \
                 --template {wildcards.template:q} \
                 --locus {params.locus:q} \
-                --configfile {params.configfile:q} \
+                --configfile {input.configfile:q} \
                 --output {output.csv:q} \
                 --checksum-output {output.checksum:q} \
                 > {log:q} 2>&1
@@ -988,7 +1036,10 @@ if DARLIN_ENABLED:
             checksums=expand(
                 str(DARLIN_WORK_DIR / "{template}" / "DARLIN_Barcodes.csv.gz.sha256"),
                 template=DARLIN_TEMPLATES,
-            )
+            ),
+            configfile=CONFIGFILE_PATH,
+            manifest=str(SAMPLE_MANIFEST_PATH),
+            barcode_map=str(BARCODE_MAP)
         output:
             DARLIN_FINAL_OUTPUTS
         log:
@@ -1002,7 +1053,9 @@ if DARLIN_ENABLED:
             python=DARLIN_PYTHON,
             templates=DARLIN_TEMPLATES,
             loci=[darlin_locus_for_template(template) for template in DARLIN_TEMPLATES],
-            configfile=CONFIGFILE_PATH,
+            config_sha256=sha256_file(Path(CONFIGFILE_PATH)),
+            source_sha256=DARLIN_SOURCE_SHA256,
+            source_contract=DARLIN_SOURCE_CONTRACT,
             final_output=lambda wildcards, output: output[0]
         shell:
             """
@@ -1012,7 +1065,7 @@ if DARLIN_ENABLED:
                 --checksum-files {input.checksums:q} \
                 --templates {params.templates:q} \
                 --loci {params.loci:q} \
-                --configfile {params.configfile:q} \
+                --configfile {input.configfile:q} \
                 --output {params.final_output:q} \
                 > {log:q} 2>&1
             """
@@ -1095,6 +1148,8 @@ rule cabernet_rna_read_fate_sample:
     resources:
         mem_mb=512,
         runtime=120
+    params:
+        source_sha256=READ_FATE_SOURCE_SHA256
     shell:
         """
         set -euo pipefail
@@ -1140,7 +1195,8 @@ rule darlin_read_fate_sample:
         mem_mb=512,
         runtime=120
     params:
-        templates=(DARLIN_TEMPLATES if DARLIN_ENABLED else [])
+        templates=(DARLIN_TEMPLATES if DARLIN_ENABLED else []),
+        source_sha256=READ_FATE_SOURCE_SHA256
     shell:
         """
         set -euo pipefail
@@ -1173,7 +1229,8 @@ rule rna_darlin_read_fate:
         mem_mb=512,
         runtime=120
     params:
-        wired_arg=READ_FATE_WIRED_ARGS
+        wired_arg=READ_FATE_WIRED_ARGS,
+        source_sha256=READ_FATE_SOURCE_SHA256
     shell:
         """
         set -euo pipefail
@@ -1221,7 +1278,9 @@ rule build_multiqc_custom_content:
         map_infos=RNA_SIMPLEAF_MAP_INFOS,
         quant_jsons=RNA_SIMPLEAF_QUANT_JSONS,
         darlin=DARLIN_FINAL_OUTPUTS,
-        darlin_barcode_metrics=DARLIN_BARCODE_METRICS
+        darlin_barcode_metrics=DARLIN_BARCODE_METRICS,
+        sample_manifest=[str(SAMPLE_MANIFEST_PATH)] if DARLIN_FINAL_OUTPUTS else [],
+        barcode_map=[str(BARCODE_MAP)] if DARLIN_FINAL_OUTPUTS else []
     output:
         custom_dir=directory(str(MULTIQC_CUSTOM_DIR)),
         alignment=( [str(RNA_QC_DIR / "rna_darlin_cell_alignment.tsv")] if DARLIN_FINAL_OUTPUTS else [] )
@@ -1241,14 +1300,16 @@ rule build_multiqc_custom_content:
             else ""
         ),
         alignment_arg=(
-            f"--alignment-output {shlex.quote(str(RNA_QC_DIR / 'rna_darlin_cell_alignment.tsv'))}"
+            f"--alignment-output {shlex.quote(str(RNA_QC_DIR / 'rna_darlin_cell_alignment.tsv'))} "
+            f"--sample-manifest {shlex.quote(str(SAMPLE_MANIFEST_PATH))} --barcode-map {shlex.quote(str(BARCODE_MAP))}"
             if DARLIN_FINAL_OUTPUTS
             else ""
         ),
         darlin_barcode_args=" ".join(
             f"--darlin-barcode-metrics {shlex.quote(str(path))}"
             for path in DARLIN_BARCODE_METRICS
-        )
+        ),
+        source_sha256=REPORT_SOURCE_SHA256
     shell:
         """
         set -euo pipefail
@@ -1282,18 +1343,17 @@ rule multiqc_report:
         runtime=60
     params:
         outdir=str(RNA_QC_DIR),
-        fastqc_dir=str(RNA_FASTQC_DIR)
+        fastqc_dir=str(RNA_FASTQC_DIR),
+        source_sha256=REPORT_SOURCE_SHA256
     shell:
         """
         set -euo pipefail
         mkdir -p {params.outdir:q} "$(dirname {log:q})"
         rm -rf {output.data:q}
         rm -f {output.report:q}
-        multiqc --force \
-            --cl-config 'data_dir_name: multiqc_data' \
-            --outdir {params.outdir:q} \
-            --filename multiqc_report.html \
-            {params.fastqc_dir:q} {input.custom_dir:q} \
+        python -m lemmus multiqc-report \
+            --output-dir {params.outdir:q} \
+            --source {params.fastqc_dir:q} --source {input.custom_dir:q} \
             > {log:q} 2>&1
         test -s {output.report:q}
         test -d {output.data:q}

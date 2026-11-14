@@ -9,9 +9,8 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-import yaml
 from .paths import PIPELINE_ROOT
-from .config import (DROPLET_WHITELIST_URL)
+from .config import DROPLET_WHITELIST_URL, read_config_mapping
 from .inputs import (
     check_cross_pipeline_alignment,
     droplet_whitelist_path,
@@ -162,7 +161,9 @@ def _check_environment_packages(prefix: Path, role: str, expected_subdir: str, s
 
     records: dict[str, dict] = {}
     native = False
-    for path in (prefix / "conda-meta").glob("*.json"):
+    for path in sorted((prefix / "conda-meta").iterdir()):
+        if path.suffix != ".json":
+            continue
         record = json.loads(path.read_text(encoding="utf-8"))
         name = record["name"]
         if name in records:
@@ -186,7 +187,7 @@ def _check_environment_packages(prefix: Path, role: str, expected_subdir: str, s
         "anndata", "ipykernel", "jupyterlab", "numba", "numpy", "packaging", "pandas", "polars",
         "pyyaml", "scikit-learn", "seaborn", "tqdm", "jsonschema", "snakemake",
         "snakemake-executor-plugin-slurm", "pip", "pysam", "cutadapt", "multiqc", "awscli",
-        "leidenalg", "cykhash", "umi_tools",
+        "leidenalg", "cykhash", "umi_tools", "macs3",
     )}
     python_distributions.update({"matplotlib-base": "matplotlib", "python-igraph": "igraph"})
     def distribution_for(name):
@@ -235,7 +236,7 @@ def check_environments_main(argv=None):
     if os_name is None:
         raise ValueError(f'unsupported managed environment platform: {sys.platform}')
     expected = os_name + '-' + ('64' if machine == 'x86_64' else machine)
-    sections = yaml.safe_load((PIPELINE_ROOT / 'core/envs.yaml').read_text())
+    sections = read_config_mapping(PIPELINE_ROOT / 'core/envs.yaml')
     for role in args.role:
         prefix = (PIPELINE_ROOT / 'conda/current' / role).resolve(strict=True)
         _check_environment_packages(prefix, role, expected, sections[role])
@@ -251,7 +252,7 @@ def env_spec_main(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     import yaml
-    payload = yaml.safe_load(args.source.read_text(encoding="utf-8"))
+    payload = read_config_mapping(args.source)
     if not isinstance(payload, dict) or args.role not in payload or not isinstance(payload[args.role], dict):
         raise SystemExit(f"invalid environment role: {args.role}")
     args.output.parent.mkdir(parents=True, exist_ok=True)

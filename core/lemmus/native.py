@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 import argparse
-import hashlib
 import json
 import os
 import platform
@@ -14,6 +13,7 @@ import sys
 import tempfile
 from pathlib import Path
 from .config import RNA_GENE_EC_ORDER
+from .io import sha256_file
 from .paths import PIPELINE_ROOT
 
 
@@ -157,25 +157,31 @@ def _smoke(binary: Path, scratch: Path):
 
 def prepare_quantifier(prefix: Path | None = None):
     """核验固定发行工件和真实原生行为后原子替换；失败保留原程序。"""
-    prefix = prefix if prefix is not None else managed_quantifier_prefix()
-    try:
-        check_quantifier(prefix)
+    if sys.platform.startswith("linux") and os.environ.get("SLURM_JOB_ID"):
+        try:
+            check_quantifier(prefix)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(
+                "Prepare the native RNA quantifier on the login node: bash core/doctor.sh conda"
+            ) from exc
         return
+    source, expected = _distribution()
+    if prefix is None:
+        prefix = PIPELINE_ROOT / "conda/native-quantifier" / expected
+    target = prefix / "bin/alevin-fry"
+    try:
+        if sha256_file(target) == expected:
+            _check_binary(target)
+            return
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
-    if sys.platform.startswith("linux") and os.environ.get("SLURM_JOB_ID"):
-        raise RuntimeError(
-            "Prepare the native RNA quantifier on the login node: bash core/doctor.sh conda"
-        )
-    source, expected = _distribution()
-    target = prefix / "bin/alevin-fry"
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix=".alevin-fry.", dir=target.parent)
     candidate = Path(name)
     try:
         with os.fdopen(fd, "wb") as writer, source.open("rb") as reader:
             shutil.copyfileobj(reader, writer)
-        if hashlib.sha256(candidate.read_bytes()).hexdigest() != expected:
+        if sha256_file(candidate) != expected:
             raise ValueError("Native RNA distribution SHA256 mismatch")
         candidate.chmod(0o755)
         _check_binary(candidate)

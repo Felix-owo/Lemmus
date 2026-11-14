@@ -42,6 +42,12 @@ RNA_QC_COLUMNS = [
     *RNA_QC_ANNOTATION_COLUMNS,
 ]
 
+DNA_CPG_COUNT_COLUMNS = (
+    "Sample_Unique_CpG_Sites",
+    "Lambda_Unique_CpG_Sites",
+    "pUC19_Unique_CpG_Sites",
+)
+
 
 class DownstreamQCError(RuntimeError):
     """Raised for any fail-closed downstream input/output problem."""

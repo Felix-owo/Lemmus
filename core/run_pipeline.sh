@@ -62,10 +62,18 @@ rna_darlin_find_project() {
   return 2
 }
 
+unset PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE VIRTUAL_ENV
+if [[ "$MODE" == init || "$MODE" == refresh ]]; then
+  maintenance_python="$RNA_DARLIN_CONTROL_ENV/bin/python"
+  if [[ -x "$maintenance_python" ]]; then
+    export PYTHONNOUSERSITE=1
+  else
+    maintenance_python="$(command -v python3 || command -v python)"
+  fi
+fi
+
 if [[ "$MODE" == init ]]; then
-  init_python="$RNA_DARLIN_CONTROL_ENV/bin/python"
-  [[ -x "$init_python" ]] || init_python="$(command -v python3 || command -v python)"
-  PYTHONPATH="$RNA_DARLIN_PIPELINE_ROOT/core" "$init_python" -m lemmus init-project --project "$PWD"
+  "$maintenance_python" -m lemmus init-project --project "$PWD"
   exit $?
 fi
 
@@ -74,54 +82,63 @@ CONFIG="$PROJECT/00_config/config.yaml"
 export RNA_DARLIN_PROJECT_DIR="$PROJECT"
 
 if [[ "$MODE" == refresh ]]; then
-  refresh_python="$RNA_DARLIN_CONTROL_ENV/bin/python"
-  [[ -x "$refresh_python" ]] || refresh_python="$(command -v python3 || command -v python)"
-  PYTHONPATH="$RNA_DARLIN_PIPELINE_ROOT/core" "$refresh_python" -m lemmus manifest-refresh --project "$PROJECT"
-  echo "manifest 已刷新: $PROJECT/00_config/sample_manifest.tsv"
+  "$maintenance_python" -m lemmus manifest-refresh --project "$PROJECT"
+  echo "manifest 已按项目配置刷新"
   exit 0
 fi
 
 rna_darlin_check_env || { echo "ERROR: managed environment incomplete; run core/doctor.sh conda" >&2; exit 127; }
 CONTROL_ENV="$RNA_DARLIN_CONTROL_ENV"; RULE_ENV="$RNA_DARLIN_RULE_ENV"
 PYTHON="$CONTROL_ENV/bin/python"; SNAKEMAKE="$CONTROL_ENV/bin/snakemake"
+export PYTHONNOUSERSITE=1
 # Check the exporter before eval: eval of empty stdout would hide its failure.
 CONFIG_SCALARS="$("$PYTHON" -m lemmus config-scalars --config "$CONFIG")" || exit $?
 eval "$CONFIG_SCALARS"
+export PATH="$RULE_ENV/bin:$RULE_ENV/lib/jvm/bin:$CONTROL_ENV/bin:$PATH"
+PLATFORM="$(uname -s)"
 # Keep this array nonempty: macOS Bash 3.2 treats empty arrays as unset under -u.
 LOCAL_ARGS=(--executor local --cores "$RNA_CORES")
 if [[ "$PIPELINE_MODE" == droplet ]]; then
+  if [[ "$PLATFORM" == Darwin ]]; then
+    if ((RNA_MEM_MB < DROPLET_PREPROCESS_MEM_MB)); then
+      echo "ERROR: macOS Droplet RNA.mem_mb=$RNA_MEM_MB is below the fixed preprocessing request of $DROPLET_PREPROCESS_MEM_MB" >&2
+      exit 2
+    fi
+    LOCAL_ARGS+=(--resources "mem_mb=$RNA_MEM_MB")
+  fi
   rna_darlin_check_calling_env || { echo "ERROR: DD-MET5 requires core/doctor.sh calling" >&2; exit 127; }
-  LOCAL_ARGS+=(--resources "mem_mb=$RNA_MEM_MB")
 fi
 
 rna_darlin_native_quantifier check || { echo "ERROR: RNA quantifier requires login-node preparation: bash core/doctor.sh conda" >&2; exit 127; }
 
 export RNA_DARLIN_CONFIG="$CONFIG" RNA_DARLIN_PROJECT_DIR="$PROJECT" RNA_DARLIN_RULE_ENV="$RULE_ENV"
-export PATH="$RULE_ENV/bin:$RULE_ENV/lib/jvm/bin:$CONTROL_ENV/bin:$PATH" PYTHONNOUSERSITE=1
 [[ ! -L "$PROJECT/05_tmp" ]] || { echo "ERROR: 05_tmp must be a real directory" >&2; exit 2; }
 export TMPDIR="$PROJECT/05_tmp" TMP="$PROJECT/05_tmp" TEMP="$PROJECT/05_tmp" TEMPDIR="$PROJECT/05_tmp"
 TMP_LITERAL="$("$RULE_ENV/bin/python" -c 'import sys; print(repr(sys.argv[1]))' "$TMPDIR")"
 LOCAL_ARGS+=(--default-resources "tmpdir=$TMP_LITERAL")
 export XDG_CACHE_HOME="$PROJECT/05_tmp/xdg_cache" MPLCONFIGDIR="$PROJECT/05_tmp/matplotlib"
-unset PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE VIRTUAL_ENV
 mkdir -p "$XDG_CACHE_HOME" "$MPLCONFIGDIR" "$PROJECT/04_logs/controller" "$PROJECT/04_logs/slurm"
 
-# Configure simpleaf once per project/controller run. Worker rules only read this cache,
-# avoiding concurrent `simpleaf set-paths` writes from multiple samples.
-export ALEVIN_FRY_HOME="$PROJECT/05_tmp/simpleaf_home"
+# 每个 controller 独占配置；第二个 controller 不能在 Snakemake 加锁前改写在途作业缓存。
+ALEVIN_FRY_HOME="$(mktemp -d "$PROJECT/05_tmp/simpleaf_home.XXXXXXXX")"
+export ALEVIN_FRY_HOME
+trap 'status=$?; rm -rf -- "$ALEVIN_FRY_HOME" || echo "WARNING: failed to clean Simpleaf home: $ALEVIN_FRY_HOME" >&2; exit "$status"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 rna_darlin_prepare_simpleaf_home "$ALEVIN_FRY_HOME" "$RULE_ENV"
 
 COMMON=(--keep-going --keep-incomplete --retries 1 --rerun-incomplete --rerun-triggers mtime input params code software-env --show-failed-logs --latency-wait "$LATENCY" --configfile "$CONFIG")
 cd "$PROJECT"
 if [[ "$MODE" == dryrun ]]; then
   export RNA_DARLIN_EXECUTOR=local
-  exec "$SNAKEMAKE" --snakefile "$RNA_DARLIN_PIPELINE_ROOT/core/Snakefile" "${LOCAL_ARGS[@]}" "${COMMON[@]}" --dry-run
+  "$SNAKEMAKE" --snakefile "$RNA_DARLIN_PIPELINE_ROOT/core/Snakefile" "${LOCAL_ARGS[@]}" "${COMMON[@]}" --dry-run
+  return
 fi
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"; LOG="$PROJECT/04_logs/controller/$RUN_ID.log"
 echo "INFO: Lemmus 开始；协议：${PIPELINE_MODE}；项目：${PROJECT}"
 echo "INFO: 配置：${CONFIG}；RNA CPU：${RNA_CORES}；RNA 内存预算：${RNA_MEM_MB} MiB"
-case "$(uname -s)" in
+case "$PLATFORM" in
   Darwin)
     export RNA_DARLIN_EXECUTOR=local
     echo "运行模式: macOS/local; controller log=$LOG"
@@ -138,7 +155,7 @@ case "$(uname -s)" in
       --slurm-logdir "$PROJECT/04_logs/slurm" --slurm-delete-logfiles-older-than 0 --slurm-qos "$QOS" \
       "${COMMON[@]}" 2>&1 | tee "$LOG"
     ;;
-  *) echo "ERROR: unsupported platform: $(uname -s)" >&2; exit 2 ;;
+  *) echo "ERROR: unsupported platform: $PLATFORM" >&2; exit 2 ;;
 esac
 }
 

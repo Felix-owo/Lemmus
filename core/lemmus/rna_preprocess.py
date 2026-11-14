@@ -1,7 +1,7 @@
 """DD-MET5 RNA：有界分块并行、原生接头匹配和按输入顺序提交。"""
 
 from __future__ import annotations
-from .io import project_temporary_parent
+from .io import project_temporary_parent, validate_file_outputs, is_valid_fastq_quality, file_stat_identity, assert_file_states_unchanged
 import argparse, io, os, time, json, tempfile, multiprocessing
 from pathlib import Path
 from collections import deque
@@ -36,6 +36,7 @@ def _initialize(adapters):
 def _process(payload):
     import dnaio
     from isal import igzip
+    from .read_fate import normalize_read_id
 
     started = time.perf_counter()
     cpu = time.process_time()
@@ -48,6 +49,12 @@ def _process(payload):
     hits = [0] * len(_ADAPTERS)
     kept = []
     for first, second in pairs:
+        # dnaio also ignores bare terminal 1/2/3; only /1 and /2 are mate suffixes here.
+        if normalize_read_id('@' + first.name) != normalize_read_id('@' + second.name):
+            raise ValueError(f'R1/R2 read-ID mismatch: {first.name!r} != {second.name!r}')
+        for mate, record in enumerate((first, second), 1):
+            if not is_valid_fastq_quality(record.qualities):
+                raise ValueError(f'FASTQ quality must contain ASCII 33..126 in R{mate} read {record.name!r}')
         metrics["input_pairs"] += 1
         if len(first) < 29:
             metrics["short_cb_umi"] += 1
@@ -111,6 +118,8 @@ def preprocess_droplet_rna(
     if not isinstance(threads, int) or isinstance(threads, bool) or threads < 1:
         raise ValueError("threads must be a positive integer")
     destinations = (output_r1, output_r2, qc)
+    validate_file_outputs((r1, r2), destinations)
+    input_states = {path: file_stat_identity(path) for path in (r1, r2)}
     for path in destinations:
         path.parent.mkdir(parents=True, exist_ok=True)
         project_temporary_parent(path)
@@ -238,6 +247,7 @@ def preprocess_droplet_rna(
         )
         candidate = Path(tmp) / "qc.json"
         candidate.write_text(json.dumps(metrics, indent=2) + "\n")
+        assert_file_states_unchanged(input_states)
         qc.unlink(missing_ok=True)
         os.replace(a, output_r1)
         os.replace(b, output_r2)

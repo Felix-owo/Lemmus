@@ -1,10 +1,14 @@
 """Lemmus：持久科学指标与 MultiQC 展示。"""
 from __future__ import annotations
-from .io import atomic_output
+from .config import DARLIN_SOURCE_CONTRACT
+from .io import atomic_output, read_delimited_frame
 
 import argparse
 import csv
+import glob
 import json
+import math
+import re
 from collections.abc import Sequence
 from pathlib import Path
 import numpy as np
@@ -35,6 +39,21 @@ def _read_json_mapping(path: Path) -> dict[str, object]:
     return payload
 
 
+def _report_count(value: object, label: str) -> int:
+    """报告保留producer的非负整数计数；不能用int把小数或非法值改成观测。"""
+    if not re.fullmatch(r'[0-9]+', str(value)):
+        raise ValueError(f'{label}: expected a nonnegative integer count, got {value!r}')
+    return int(value)
+
+
+def _report_fraction(value: object, label: str) -> float:
+    """barcode纠错比例的分母在producer定义；报告只接受有限的0–1原始比例。"""
+    fraction = float(value)
+    if not math.isfinite(fraction) or not 0 <= fraction <= 1:
+        raise ValueError(f'{label}: expected a finite fraction in [0, 1]')
+    return fraction
+
+
 def build_multiqc_custom_content(
     *,
     samples: list[str],
@@ -45,6 +64,8 @@ def build_multiqc_custom_content(
     darlin_clone_table: Path | None = None,
     darlin_barcode_metrics: list[Path] | None = None,
     alignment_output: Path | None = None,
+    sample_manifest: Path | None = None,
+    barcode_map: Path | None = None,
 ) -> list[Path]:
     """Create deterministic MultiQC custom-content JSON files.
 
@@ -72,6 +93,8 @@ def build_multiqc_custom_content(
     for sample, h5ad_path, map_path, quant_path in zip(samples, rna_h5ads, map_infos, quant_jsons, strict=True):
         adata = ad.read_h5ad(h5ad_path, backed="r")
         try:
+            if not adata.obs_names.is_unique:
+                raise ValueError(f'Finalized RNA cell identities are not unique: {h5ad_path}')
             n_cells = int(adata.n_obs)
             n_genes = int(adata.n_vars)
             rna_cell_ids[sample] = set(str(cell_id) for cell_id in adata.obs_names)
@@ -147,18 +170,20 @@ def build_multiqc_custom_content(
         outputs.append(simpleaf_path)
 
     if darlin_clone_table is not None:
-        clone_df = pd.read_csv(darlin_clone_table)
+        clone_df = read_delimited_frame(darlin_clone_table)
         expected = {"Sample_ID", "DARLIN_QC_Pass", "DARLIN_Total_Read_Count", "DARLIN_Total_UMI_Count", "DARLIN_Barcodes_Used", "DARLIN_Double_Cell_Suspect"}
         missing = expected.difference(clone_df.columns)
         if missing:
             raise ValueError(f"DARLIN clone table lacks MultiQC columns: {sorted(missing)}")
+        if clone_df['Sample_ID'].eq('').any() or clone_df['Sample_ID'].duplicated().any():
+            raise ValueError('DARLIN clone table requires nonempty unique Sample_ID')
         def _table_bool(value: object) -> bool:
             if isinstance(value, bool):
                 return value
             text = str(value).strip().lower()
             if text in {"true", "1", "yes"}:
                 return True
-            if text in {"false", "0", "no", "", "nan"}:
+            if text in {"false", "0", "no"}:
                 return False
             raise ValueError(f"Unexpected boolean value in DARLIN clone table: {value!r}")
 
@@ -168,9 +193,9 @@ def build_multiqc_custom_content(
             sid = str(record["Sample_ID"])
             darlin_data[sid] = {
                 "QC pass": _table_bool(record["DARLIN_QC_Pass"]),
-                "Total reads": int(record["DARLIN_Total_Read_Count"]),
-                "Total UMIs": int(record["DARLIN_Total_UMI_Count"]),
-                "Barcodes used": int(record["DARLIN_Barcodes_Used"]),
+                "Total reads": _report_count(record["DARLIN_Total_Read_Count"], f'{sid} total reads'),
+                "Total UMIs": _report_count(record["DARLIN_Total_UMI_Count"], f'{sid} total UMIs'),
+                "Barcodes used": _report_count(record["DARLIN_Barcodes_Used"], f'{sid} barcodes used'),
                 "Double-cell suspect": _table_bool(record["DARLIN_Double_Cell_Suspect"]),
             }
         darlin_payload = {
@@ -186,18 +211,37 @@ def build_multiqc_custom_content(
         outputs.append(darlin_path)
 
         if alignment_output is not None:
-            darlin_ids_by_sample: dict[str, set[str]] = {sample: set() for sample in samples}
+            from .inputs import read_manifest, load_barcode_config, validate_barcode_map_provenance
+
+            if sample_manifest is None or barcode_map is None:
+                raise ValueError('RNA/DARLIN alignment requires the project manifest and Barcode_Map')
+            validate_barcode_map_provenance(clone_df,barcode_map)
+            _, libraries = read_manifest(sample_manifest)
+            rna_libraries = {row['sample_id'] for row in libraries if row['rna_sample']}
+            if set(samples) != rna_libraries:
+                raise ValueError('RNA report libraries disagree with the project manifest')
+            cells = load_barcode_config(barcode_map).rows
+            owners = {}
+            for library in libraries:
+                for cell in cells:
+                    cell_id = f"{library['sample_id']}_{cell.plate_id}"
+                    if cell_id in owners:
+                        raise ValueError(f'Ambiguous project cell identity in manifest/Barcode_Map: {cell_id!r}')
+                    owners[cell_id] = library['sample_id']
+            for sample, identities in rna_cell_ids.items():
+                if any(owners.get(cell_id) != sample for cell_id in identities):
+                    raise ValueError(f'RNA cell identities disagree with manifest/Barcode_Map: {sample!r}')
+            darlin_ids_by_sample: dict[str, set[str]] = {row['sample_id']: set() for row in libraries}
             for sid in clone_df["Sample_ID"].astype(str):
-                owners = [sample for sample in samples if sid.startswith(f"{sample}_")]
-                if len(owners) != 1:
+                owner = owners.get(sid)
+                if owner is None:
                     raise ValueError(
-                        f"DARLIN Sample_ID {sid!r} does not map to exactly one RNA sample_id; "
-                        "refusing to guess the per-sample cell alignment"
+                        f"DARLIN Sample_ID {sid!r} is absent from the manifest/Barcode_Map cell identities"
                     )
-                darlin_ids_by_sample[owners[0]].add(sid)
+                darlin_ids_by_sample[owner].add(sid)
             alignment_data: dict[str, dict[str, object]] = {}
             tsv_rows = []
-            for sample in samples:
+            for sample in darlin_ids_by_sample:
                 rna_ids = rna_cell_ids.get(sample, set())
                 darlin_ids = darlin_ids_by_sample.get(sample, set())
                 matched = rna_ids & darlin_ids
@@ -251,26 +295,44 @@ def build_multiqc_custom_content(
             "sample", "total_reads", "exact_barcode_reads", "corrected_hamming1_reads",
             "ambiguous_barcode_reads", "unmatched_barcode_reads", "accepted_barcode_reads",
             "accepted_fraction", "correction_fraction_of_accepted",
+            "source_type", "source_identity_contract",
+            "darlin_candidate_reads_any_template", "dual_anchor_reads_any_template",
         }
         for metrics_path in darlin_barcode_metrics:
-            metrics = pd.read_csv(metrics_path, sep="\t")
+            metrics = read_delimited_frame(metrics_path, sep="\t")
             missing = expected_columns.difference(metrics.columns)
             if missing or len(metrics) != 1:
                 raise ValueError(f"Invalid DARLIN barcode metrics {metrics_path}: missing={sorted(missing)}, rows={len(metrics)}")
             row = metrics.iloc[0]
+            if (row['source_type'] not in ('targeted','rna_rescue')
+                    or row['source_identity_contract'] != DARLIN_SOURCE_CONTRACT):
+                raise ValueError(f'Invalid DARLIN source metadata; rerun extract-barcodes-multi: {metrics_path}')
             sample = str(row["sample"])
+            if not sample or sample in barcode_data:
+                raise ValueError(f'DARLIN barcode metrics require a nonempty unique sample: {sample!r}')
+            counts = {key: _report_count(row[key], f'{metrics_path}: {key}') for key in (
+                'total_reads', 'exact_barcode_reads', 'corrected_hamming1_reads',
+                'ambiguous_barcode_reads', 'unmatched_barcode_reads', 'accepted_barcode_reads')}
+            if (counts['total_reads'] != sum(counts[key] for key in (
+                    'exact_barcode_reads', 'corrected_hamming1_reads', 'ambiguous_barcode_reads', 'unmatched_barcode_reads'))
+                    or counts['accepted_barcode_reads'] != counts['exact_barcode_reads'] + counts['corrected_hamming1_reads']):
+                raise ValueError(f'DARLIN barcode read accounting failed: {metrics_path}')
+            candidates = _report_count(row['darlin_candidate_reads_any_template'], f'{sample} candidate reads')
+            dual_anchor = _report_count(row['dual_anchor_reads_any_template'], f'{sample} dual-anchor reads')
+            if not dual_anchor <= candidates <= counts['accepted_barcode_reads']:
+                raise ValueError(f'DARLIN candidate read accounting failed: {metrics_path}')
             barcode_data[sample] = {
-                "Total reads": int(row["total_reads"]),
-                "Exact barcode reads": int(row["exact_barcode_reads"]),
-                "Hamming-1 corrected reads": int(row["corrected_hamming1_reads"]),
-                "Ambiguous barcode reads": int(row["ambiguous_barcode_reads"]),
-                "Unmatched barcode reads": int(row["unmatched_barcode_reads"]),
-                "Accepted barcode reads": int(row["accepted_barcode_reads"]),
-                "Accepted barcode (%)": float(row["accepted_fraction"]) * 100.0,
-                "Correction among accepted (%)": float(row["correction_fraction_of_accepted"]) * 100.0,
-                "Source type": str(row["source_type"]) if "source_type" in metrics.columns else ("RNA rescue" if sample.endswith("__RNA") else "targeted"),
-                "DARLIN candidate reads": int(row["darlin_candidate_reads_any_template"]) if "darlin_candidate_reads_any_template" in metrics.columns else 0,
-                "Dual-anchor reads": int(row["dual_anchor_reads_any_template"]) if "dual_anchor_reads_any_template" in metrics.columns else 0,
+                "Total reads": counts["total_reads"],
+                "Exact barcode reads": counts["exact_barcode_reads"],
+                "Hamming-1 corrected reads": counts["corrected_hamming1_reads"],
+                "Ambiguous barcode reads": counts["ambiguous_barcode_reads"],
+                "Unmatched barcode reads": counts["unmatched_barcode_reads"],
+                "Accepted barcode reads": counts["accepted_barcode_reads"],
+                "Accepted barcode (%)": _report_fraction(row["accepted_fraction"], f'{sample} accepted fraction') * 100.0,
+                "Correction among accepted (%)": _report_fraction(row["correction_fraction_of_accepted"], f'{sample} correction fraction') * 100.0,
+                "Source type": row['source_type'],
+                "DARLIN candidate reads": candidates,
+                "Dual-anchor reads": dual_anchor,
             }
         barcode_payload = {
             "id": "darlin_barcode_qc",
@@ -295,6 +357,8 @@ def multiqc_custom_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--darlin-clone-table", type=Path, default=None)
     parser.add_argument("--darlin-barcode-metrics", action="append", type=Path, default=[])
     parser.add_argument("--alignment-output", type=Path, default=None, help="Per-sample RNA/DARLIN cell parity audit TSV.")
+    parser.add_argument("--sample-manifest", type=Path, default=None)
+    parser.add_argument("--barcode-map", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args(argv)
     build_multiqc_custom_content(
@@ -306,5 +370,32 @@ def multiqc_custom_main(argv: Sequence[str] | None = None) -> int:
         darlin_clone_table=args.darlin_clone_table,
         darlin_barcode_metrics=args.darlin_barcode_metrics,
         alignment_output=args.alignment_output,
+        sample_manifest=args.sample_manifest,
+        barcode_map=args.barcode_map,
     )
     return 0
+
+
+def multiqc_report_main(argv: Sequence[str] | None = None) -> int:
+    """独立报告进程只读原生默认值与Pipeline配置，禁止隐式配置改写样本或删模块。"""
+    parser = argparse.ArgumentParser(description="Generate the isolated RNA/DARLIN MultiQC report.")
+    parser.add_argument("--source", action="append", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    args = parser.parse_args(argv)
+    import multiqc
+    from multiqc.core.update_config import ClConfig
+
+    find_user_files = multiqc.config.find_user_files
+    multiqc.config.find_user_files = lambda: None
+    try:
+        result = multiqc.run(
+            *(glob.escape(str(path.resolve(strict=True))) for path in args.source),
+            cfg=ClConfig(output_dir=args.output_dir, filename="multiqc_report.html", force=True,
+                         cl_config=[json.dumps({'data_dir_name': 'multiqc_data', 'fn_clean_trim': [],
+                                               'fn_clean_exts': [{'type': 'regex', 'module': 'fastqc',
+                                                                  'pattern': r'\.fastq\.gz$'}]})]),
+            interactive=False,
+        )
+        return result.sys_exit_code
+    finally:
+        multiqc.config.find_user_files = find_user_files

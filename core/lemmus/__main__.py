@@ -32,6 +32,7 @@ def main(argv=None):
         "export-rna-counts": ("rna", "export_rna_counts_main"),
         "prepare-rna-counts": ("rna", "prepare_rna_counts_main"),
         "multiqc-custom": ("reports", "multiqc_custom_main"),
+        "multiqc-report": ("reports", "multiqc_report_main"),
         "env-spec": ("maintenance", "env_spec_main"),
         "check-environments": ("maintenance", "check_environments_main"),
         "check-calling": ("maintenance", "check_calling_main"),

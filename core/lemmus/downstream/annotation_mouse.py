@@ -28,7 +28,7 @@ from typing import Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-MODULE_VERSION = "v1"
+MODULE_VERSION = "v2"
 
 # Broad lineage programs (mouse MGI symbols; matched case-insensitively so
 # both MGI-style "Cd79a" and uppercase exports resolve to the same gene).
@@ -63,12 +63,8 @@ STATE_PROGRAMS_BY_BROAD: Mapping[str, Mapping[str, tuple[str, ...]]] = {
 
 # Decision thresholds. These mirror the human annotation contract where a
 # cluster-level decision is required before any cell-level label is written.
-# Detection is support-aware: parsimony-gene-em emits fractional expected
-# counts, so a gene counts as detected only at >= 1.0 expected UMI
-# (log1p >= log(2)) — the same support rule as the pipeline's
-# n_genes_supported metric. Plain expr > 0 would let fractional allocations
-# inflate every program's detection.
-DETECTION_LOG1P_MIN = float(np.log1p(1.0))
+# Support is measured before library-size normalization, which changes the UMI scale.
+DETECTION_MIN_UMI = 1.0
 MIN_PROGRAM_GENE_COVERAGE = 0.50  # program is unscored when fewer genes map
 BROAD_MIN_DETECTION = 0.35        # top lineage mean detection fraction (high confidence)
 BROAD_MEDIUM_DETECTION = 0.25     # top lineage mean detection fraction (medium confidence)
@@ -123,8 +119,7 @@ def _program_detection_scores(
 ) -> tuple[dict[str, float], dict[str, float], dict[str, list[str]]]:
     """Mean within-cluster support-aware detection fraction per program.
 
-    A gene is detected at log1p expression >= log(2), i.e. >= 1.0 expected
-    UMI on the linear scale; fractional EM allocations do not count.
+    A gene is detected at >= 1.0 original UMI, before normalization or scaling.
     """
     scores: dict[str, float] = {}
     coverage: dict[str, float] = {}
@@ -137,7 +132,7 @@ def _program_detection_scores(
         if len(mapped) / len(genes) < MIN_PROGRAM_GENE_COVERAGE or not mapped:
             scores[label] = float("nan")
             continue
-        detection = cluster_block[mapped].ge(DETECTION_LOG1P_MIN).mean(axis=0)
+        detection = cluster_block[mapped].ge(DETECTION_MIN_UMI).mean(axis=0)
         scores[label] = float(detection.mean())
     return scores, coverage, present_genes
 
@@ -198,8 +193,8 @@ def annotate_mouse_marker_program_core(
 ) -> MouseMarkerAnnotation:
     """Deterministic cluster-level marker-program annotation (pure pandas).
 
-    ``expression`` must be cells x genes log-normalized values (detection only
-    needs expr > 0). ``clusters`` is the per-cell cluster label (string-cast).
+    ``expression`` must be cells x genes original molecule counts, before
+    normalization. ``clusters`` is the per-cell cluster label (string-cast).
     ``markers_top30`` optionally carries per-cluster top markers with
     ``names`` (gene symbols), ``pvals_adj`` and ``logfoldchanges``.
     """
@@ -321,7 +316,7 @@ def annotate_mouse_marker_program_core(
         "module_version": MODULE_VERSION,
         "deterministic": True,
         "thresholds": {
-            "detection_log1p_min": DETECTION_LOG1P_MIN,
+            "detection_min_umi": DETECTION_MIN_UMI,
             "min_program_gene_coverage": MIN_PROGRAM_GENE_COVERAGE,
             "broad_min_detection": BROAD_MIN_DETECTION,
             "broad_medium_detection": BROAD_MEDIUM_DETECTION,
@@ -332,9 +327,12 @@ def annotate_mouse_marker_program_core(
             "marker_logfc_min": MARKER_LOGFC_MIN,
             "marker_detection_diff_min": MARKER_DETECTION_DIFF_MIN,
         },
-        "lineage_programs": {
-            label: list(genes) for label, genes in MOUSE_LINEAGE_PROGRAMS.items()
-        },
+        # Biological labels can contain '/' and must be values, not HDF5 path keys.
+        "lineage_programs": pd.DataFrame([
+            {"lineage": label, "gene_symbol": gene, "gene_order": order}
+            for label, genes in MOUSE_LINEAGE_PROGRAMS.items()
+            for order, gene in enumerate(genes, start=1)
+        ]),
         "state_programs": {
             broad: {label: list(genes) for label, genes in programs.items()}
             for broad, programs in STATE_PROGRAMS_BY_BROAD.items()
@@ -352,32 +350,30 @@ def annotate_mouse_marker_program(
     cluster_key: str = "leiden",
     gene_symbol_column: str = "gene_symbol",
 ) -> MouseMarkerAnnotation:
-    """anndata wrapper: expression comes from ``adata.raw`` (log1p, full genes).
-
-    The notebook scales ``adata.X`` for PCA, so the marker programs must be
-    scored on the pre-scaling log-normalized matrix retained in ``raw``.
-    """
+    """Score original molecule support from counts; raw and X have transformed units."""
     if cluster_key not in adata.obs.columns:
         raise MouseAnnotationError(f"adata.obs lacks cluster column: {cluster_key}")
     if gene_symbol_column not in adata.var.columns:
         raise MouseAnnotationError(f"adata.var lacks gene symbol column: {gene_symbol_column}")
-    if adata.raw is not None:
-        source, var_symbols = adata.raw.to_adata(), adata.raw.var[gene_symbol_column]
-    else:
-        source, var_symbols = adata, adata.var[gene_symbol_column]
+    if 'counts' not in adata.layers:
+        raise MouseAnnotationError('Mouse annotation requires the original counts layer')
+    from ..rna import validate_rna_count_matrix
     import scipy.sparse as sp
 
-    matrix = source.X
+    matrix = adata.layers['counts']
+    validate_rna_count_matrix(matrix)
     if sp.issparse(matrix):
         matrix = matrix.toarray()
     expression = pd.DataFrame(
         np.asarray(matrix, dtype=float),
-        index=source.obs_names.astype(str),
-        columns=var_symbols.astype(str),
+        index=adata.obs_names.astype(str),
+        columns=adata.var[gene_symbol_column].astype(str),
     )
-    return annotate_mouse_marker_program_core(
+    result = annotate_mouse_marker_program_core(
         expression,
         clusters=adata.obs[cluster_key],
         markers_top30=markers_top30,
         marker_cluster_column=cluster_key,
     )
+    result.uns['detection_source'] = 'layers/counts'
+    return result

@@ -1,6 +1,6 @@
 """Lemmus：输入发现、manifest 与 barcode 身份。"""
 from __future__ import annotations
-from .io import project_temporary_parent, atomic_output
+from .io import project_temporary_parent, atomic_output, validate_file_outputs, stable_file_identity, file_stat_identity, assert_file_states_unchanged
 
 import argparse
 import csv
@@ -8,6 +8,7 @@ import gzip
 import hashlib
 import os
 import re
+import stat
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -29,6 +30,7 @@ from .io import (
     has_complete_record,
     open_binary,
     read_fastq_record,
+    iter_tree_files,
 )
 
 
@@ -97,14 +99,20 @@ def load_barcode_config(path: str | Path, *, require_rna: bool=True) -> BarcodeC
     with handle:
         reader = csv.DictReader(handle)
         fields = tuple(reader.fieldnames or ())
+        if (not fields or any(not field or field != field.strip() for field in fields)
+                or len({field.casefold() for field in fields}) != len(fields)):
+            raise BarcodeConfigError('Barcode_Map.csv header has blank, duplicate or padded columns')
         missing = [field for field in REQUIRED_COLUMNS if field not in fields]
         if missing:
             raise BarcodeConfigError('Barcode_Map.csv is missing column(s): ' + ', '.join(missing))
         rows: list[BarcodeEntry] = []
         seen_barcodes: set[str] = set()
-        seen_cells: set[tuple[str, str]] = set()
+        seen_plates: set[str] = set()
+        seen_orders: set[str] = set()
         expected_length: int | None = None
         for line_number, raw in enumerate(reader, start=2):
+            if None in raw or any(value is None for value in raw.values()):
+                raise BarcodeConfigError(f'Barcode_Map.csv line {line_number} field count differs from its header')
             barcode = str(raw.get('RNA_Barcode', '') or '').strip()
             plate_id = str(raw.get('PlateID', '') or '').strip()
             cell_order = str(raw.get('Cell_Order', '') or '').strip()
@@ -119,10 +127,13 @@ def load_barcode_config(path: str | Path, *, require_rna: bool=True) -> BarcodeC
                 raise BarcodeConfigError(f'Barcode_Map.csv line {line_number} requires PlateID and Cell_Order')
             if barcode in seen_barcodes:
                 raise BarcodeConfigError(f'Duplicate RNA_Barcode: {barcode}')
-            if (plate_id, cell_order) in seen_cells:
-                raise BarcodeConfigError(f'Duplicate PlateID/Cell_Order: {plate_id}/{cell_order}')
+            if plate_id in seen_plates:
+                raise BarcodeConfigError(f'Duplicate PlateID: {plate_id}')
+            if cell_order in seen_orders:
+                raise BarcodeConfigError(f'Duplicate Cell_Order: {cell_order}')
             seen_barcodes.add(barcode)
-            seen_cells.add((plate_id, cell_order))
+            seen_plates.add(plate_id)
+            seen_orders.add(cell_order)
             rows.append(BarcodeEntry(barcode, plate_id, cell_order, line_number))
     if require_rna and (not rows):
         raise BarcodeConfigError('Barcode_Map.csv contains no RNA barcodes')
@@ -141,6 +152,7 @@ def load_barcode_config(path: str | Path, *, require_rna: bool=True) -> BarcodeC
 
 def write_rna_whitelist(config: BarcodeConfig, output_path: str | Path) -> Path:
     output = Path(output_path).expanduser().resolve()
+    validate_file_outputs((config.path,), (output,))
     output.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f'.{output.name}.', dir=project_temporary_parent(output), text=True)
     try:
@@ -183,23 +195,25 @@ def discover_fastq_pairs(raw_dir: str | Path) -> tuple[dict[str, dict[str, Path]
     pairs: dict[str, dict[str, Path]] = {}
     warnings: list[str] = []
     invalid: set[str] = set()
-    if not root_dir.exists():
+    try:
+        root_dir.stat()
+    except FileNotFoundError:
         return ({}, [f'raw directory does not exist: {root_dir}'])
-    for root, _, files in os.walk(root_dir):
-        for filename in files:
-            if not filename.lower().endswith(('.fastq.gz', '.fq.gz')):
-                continue
-            path = Path(root) / filename
-            sample, read = parse_fastq_name(path)
-            if sample is None or read is None:
-                warnings.append(f'ignored FASTQ with unsupported name: {path}')
-                continue
-            entry = pairs.setdefault(sample, {})
-            if read in entry and entry[read] != path:
-                warnings.append(f'multiple {read} FASTQs for sample {sample}')
-                invalid.add(sample)
-            else:
-                entry[read] = path
+    for path in iter_tree_files(root_dir):
+        if not path.name.lower().endswith(('.fastq.gz', '.fq.gz')):
+            continue
+        if not stat.S_ISREG(path.stat().st_mode):
+            continue
+        sample, read = parse_fastq_name(path)
+        if sample is None or read is None:
+            warnings.append(f'ignored FASTQ with unsupported name: {path}')
+            continue
+        entry = pairs.setdefault(sample, {})
+        if read in entry and entry[read] != path:
+            warnings.append(f'multiple {read} FASTQs for sample {sample}')
+            invalid.add(sample)
+        else:
+            entry[read] = path
     complete: dict[str, dict[str, Path]] = {}
     for sample, reads in sorted(pairs.items()):
         if sample in invalid:
@@ -225,16 +239,23 @@ def read_manifest(path: str | Path) -> tuple[list[str], list[dict[str, str]]]:
     with manifest.open(encoding='utf-8-sig', newline='') as handle:
         delimiter = '\t' if manifest.suffix.lower() in {'.tsv', '.txt'} else ','
         reader = csv.DictReader(handle, delimiter=delimiter)
-        fields = [str(field).strip() for field in reader.fieldnames or []]
+        fields = list(reader.fieldnames or [])
+        if (not fields or any(not field or field != field.strip() for field in fields)
+                or len({field.casefold() for field in fields}) != len(fields)):
+            raise ValueError('sample_manifest.tsv header has blank, duplicate or padded columns')
         missing = [field for field in REQUIRED_MANIFEST_FIELDS if field not in fields]
         if missing:
             raise ValueError('sample_manifest.tsv is missing column(s): ' + ', '.join(missing))
         rows = []
         sample_lines: dict[str, int] = {}
         for line_number, raw in enumerate(reader, start=2):
+            if None in raw or any(value is None for value in raw.values()):
+                raise ValueError(f'sample_manifest.tsv line {line_number} field count differs from its header')
             row = {field: (raw.get(field) or '').strip() for field in fields}
-            if not SAMPLE_ID_PATTERN.fullmatch(row['sample_id']):
-                raise ValueError(f"sample_manifest.tsv line {line_number} has invalid sample_id {row['sample_id']!r}")
+            for field in ('sample_id', 'rna_sample', 'darlin_sample'):
+                value = row.get(field, '')
+                if (field == 'sample_id' or value) and not SAMPLE_ID_PATTERN.fullmatch(value):
+                    raise ValueError(f"sample_manifest.tsv line {line_number} has invalid {field} {value!r}")
             previous_line = sample_lines.get(row['sample_id'])
             if previous_line is not None:
                 raise ValueError(f"sample_manifest.tsv has duplicate sample_id {row['sample_id']!r} on lines {previous_line} and {line_number}")
@@ -263,19 +284,57 @@ def map_fastq_pairs_to_manifest(pairs: Mapping[str, Mapping[str, Path]], rows: l
     return mapped
 
 
+def darlin_source_roles(rows, *, include_rna: bool):
+    """从当前manifest生成实际DAG来源角色；名称本身不定义生物学来源。"""
+    if type(include_rna) is not bool:
+        raise ValueError('DARLIN.include_rna_fastq must be a boolean')
+    roles = {row['sample_id']:(row['sample_id'], 'targeted') for row in rows if row['darlin_sample']}
+    if include_rna:
+        for row in rows:
+            if row['rna_sample'] and row['darlin_sample']:
+                source = row['sample_id']+'__RNA'
+                if source in roles:
+                    raise ValueError(f'RNA-derived DARLIN source conflicts with another DARLIN sample: {source}')
+                roles[source] = row['sample_id'], 'rna_rescue'
+    return roles
+
+
 def refresh(project: Path, *, dry_run: bool=False) -> list[dict[str, str]]:
     project = project.expanduser().resolve()
-    manifest = project / '00_config' / 'sample_manifest.tsv'
+    def identity(path):
+        try:
+            return stable_file_identity(path)
+        except FileNotFoundError:
+            return None
+    config_path = project/'00_config/config.yaml'
+    config_identity = identity(config_path)
+    config = load_config(config_path) if config_identity is not None else {}
+    def configured_path(value):
+        path = Path(value).expanduser()
+        return path if path.is_absolute() else project/path
+    manifest = configured_path(config.get('sample_manifest','00_config/sample_manifest.tsv'))
+    expected_inputs = {config_path:config_identity,manifest:identity(manifest)}
+    fieldnames = list(MANIFEST_FIELDS)
     existing: list[dict[str, str]] = []
-    if manifest.is_file():
-        _, existing = read_manifest(manifest)
+    if expected_inputs[manifest] is not None:
+        fields, existing = read_manifest(manifest)
+        fieldnames = list(dict.fromkeys([*fields,*fieldnames]))
+    def check_inputs():
+        for path, expected in expected_inputs.items():
+            if identity(path) != expected:
+                raise ValueError(f'Manifest refresh input changed before commit: {path}')
     by_rna = {row['rna_sample']: row for row in existing if row.get('rna_sample')}
     by_darlin = {row['darlin_sample']: row for row in existing if row.get('darlin_sample')}
-    rna, rna_warnings = discover_fastq_pairs(project / '01_raw' / 'RNA')
-    darlin, darlin_warnings = discover_fastq_pairs(project / '01_raw' / 'DARLIN')
+    rna, rna_warnings = discover_fastq_pairs(configured_path(config.get('raw_data_dir','01_raw/RNA')))
+    darlin, darlin_warnings = discover_fastq_pairs(configured_path(config.get('DARLIN',{}).get('fastq_dir') or '01_raw/DARLIN'))
     warnings = rna_warnings + darlin_warnings
     if warnings:
         raise ValueError('; '.join(warnings))
+    sources = [config_path,*(pair[mate] for pairs in (rna,darlin)
+                            for pair in pairs.values() for mate in ('R1','R2'))]
+    if config.get('barcode_map'):
+        sources.append(configured_path(config['barcode_map']))
+    validate_file_outputs(sources,[manifest])
     rows: list[dict[str, str]] = []
     used: set[int] = set()
     for raw_sample in sorted(rna):
@@ -286,7 +345,7 @@ def refresh(project: Path, *, dry_run: bool=False) -> list[dict[str, str]]:
         if row is None:
             row = {'sample_id': raw_sample, 'rna_sample': raw_sample, 'darlin_sample': raw_sample if raw_sample in darlin else '', 'species': '', 'notes': ''}
         used.add(id(row))
-        rows.append({field: row.get(field, '') for field in MANIFEST_FIELDS})
+        rows.append({field: row.get(field, '') for field in fieldnames})
     for raw_sample in sorted(darlin):
         if any((row['darlin_sample'] == raw_sample for row in rows)):
             continue
@@ -297,7 +356,7 @@ def refresh(project: Path, *, dry_run: bool=False) -> list[dict[str, str]]:
         if row is None:
             row = {'sample_id': raw_sample, 'rna_sample': '', 'darlin_sample': raw_sample, 'species': '', 'notes': ''}
         used.add(id(row))
-        rendered = {field: row.get(field, '') for field in MANIFEST_FIELDS}
+        rendered = {field: row.get(field, '') for field in fieldnames}
         for index, existing_row in enumerate(rows):
             if existing_row['sample_id'] == rendered['sample_id']:
                 rows[index] = rendered
@@ -308,15 +367,17 @@ def refresh(project: Path, *, dry_run: bool=False) -> list[dict[str, str]]:
     if stale:
         raise ValueError('Manifest contains samples absent from current RNA/DARLIN FASTQs: ' + ', '.join(stale))
     if dry_run:
-        writer = csv.DictWriter(sys.stdout, fieldnames=MANIFEST_FIELDS, delimiter='\t', lineterminator='\n')
+        check_inputs()
+        writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames, delimiter='\t', lineterminator='\n')
         writer.writeheader()
         writer.writerows(rows)
     else:
-        with atomic_output(manifest) as temporary:
+        with atomic_output(manifest,project_dir=project) as temporary:
             with temporary.open('w', encoding='utf-8', newline='') as handle:
-                writer = csv.DictWriter(handle, fieldnames=MANIFEST_FIELDS, delimiter='\t', lineterminator='\n')
+                writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter='\t', lineterminator='\n')
                 writer.writeheader()
                 writer.writerows(rows)
+            check_inputs()
     return rows
 
 
@@ -334,16 +395,16 @@ def droplet_whitelist_path() -> Path:
     return PIPELINE_ROOT / "resources/droplet/U3CB_methylation.txt.gz"
 
 
-def barcode_map_projection(path: Path) -> tuple[tuple[str, str, str], ...]:
-    """读取孔板身份投影；拒绝空表、重复身份和损坏行，保留身份字符串。"""
-    columns = ('plateid', 'rna_barcode', 'cell_order')
+def barcode_map_projection(path: Path, barcode_column: str) -> tuple[tuple[str, str], ...]:
+    """核对各模态自身条码，返回跨模态共享的孔位与顺序；不要求对方保存本模态条码。"""
+    columns = ('plateid', barcode_column, 'cell_order')
     with path.open(encoding='utf-8-sig', newline='') as handle:
         reader = csv.reader(handle)
         header = [field.strip().lower() for field in next(reader, [])]
         if not header or any(not field for field in header) or len(set(header)) != len(header):
             raise ValueError(f'{path}: Barcode_Map 表头为空或重复')
         if not set(columns).issubset(header):
-            raise ValueError(f'{path}: Barcode_Map 缺少 PlateID/RNA_Barcode/Cell_Order')
+            raise ValueError(f'{path}: Barcode_Map 缺少 {"/".join(columns)}')
         indices = [header.index(field) for field in columns]
         rows = []
         seen = [set() for _ in columns]
@@ -357,7 +418,7 @@ def barcode_map_projection(path: Path) -> tuple[tuple[str, str, str], ...]:
                 raise ValueError(f'{path}:{number}: Barcode_Map 身份重复')
             for value, values in zip(row, seen):
                 values.add(value)
-            rows.append(row)
+            rows.append((row[0], row[2]))
     if not rows:
         raise ValueError(f'{path}: Barcode_Map 没有数据行')
     return tuple(sorted(rows))
@@ -374,10 +435,10 @@ def check_cross_pipeline_alignment(pipeline_root: Path, dna_root: Path | None = 
         print(f'WARN: {message}（可用 DNA_PIPELINE_ROOT 指定）')
         return
     print(f'Alopex Pipeline: {dna_root}')
-    rna_map = barcode_map_projection(pipeline_root / 'resources/Barcode_Map.csv')
-    dna_map = barcode_map_projection(dna_root / 'resources/Barcode_Map.csv')
+    rna_map = barcode_map_projection(pipeline_root / 'resources/Barcode_Map.csv', 'rna_barcode')
+    dna_map = barcode_map_projection(dna_root / 'resources/Barcode_Map.csv', 'dna_barcode')
     if rna_map != dna_map:
-        raise ValueError('Cabernet: Lemmus 与 Alopex 的 (PlateID, RNA_Barcode, Cell_Order) 不一致')
+        raise ValueError('Cabernet: Lemmus 与 Alopex 的 (PlateID, Cell_Order) 不一致')
     print(f'Cabernet Barcode_Map 跨 Pipeline 一致性: PASS ({len(rna_map)} cells)')
     rna_design = pipeline_root / 'resources/droplet/U3CB_methylation.txt.gz'
     dna_design = dna_root / 'resources/droplet_ME5_U3CB_methylation.txt.gz'
@@ -414,11 +475,23 @@ def _barcode_map_digest(path):
         for chunk in iter(lambda: handle.read(1024 * 1024), b''):
             digest.update(chunk)
     with Path(path).open(encoding='utf-8-sig', newline='') as handle:
-        next(handle, None)
-        for line in handle:
-            if line.strip():
-                row_count += 1
+        reader = csv.reader(handle, strict=True)
+        next(reader, None)
+        row_count = sum(1 for row in reader if row)
     return (digest.hexdigest(), row_count)
+
+
+def validate_barcode_map_provenance(frame, barcode_map):
+    """clone与RNA跨来源关联前核对实际map来源，不以同名孔位代替来源证明。"""
+    identity = stable_file_identity(barcode_map)
+    expected_sha, expected_rows = _barcode_map_digest(barcode_map)
+    if not {'Barcode_Map_SHA256','Barcode_Map_Rows'}.issubset(frame):
+        raise ValueError('DARLIN clone lacks Barcode Map source provenance; rerun build-clone-table')
+    if (not frame['Barcode_Map_SHA256'].eq(expected_sha).all()
+            or not frame['Barcode_Map_Rows'].eq(str(expected_rows)).all()):
+        raise ValueError('DARLIN clone Barcode Map provenance differs from the current source; rerun build-clone-table')
+    if expected_sha != identity[0] or stable_file_identity(barcode_map) != identity:
+        raise ValueError('Barcode Map source changed while reading DARLIN clone provenance')
 
 
 def assert_fastq_main(argv=None) -> int:
@@ -459,43 +532,49 @@ def prefilter(args: argparse.Namespace) -> None:
     output_r1 = Path(args.output_r1)
     output_r2 = Path(args.output_r2)
     metrics = Path(args.metrics)
-    output_r1.parent.mkdir(parents=True, exist_ok=True)
-    output_r2.parent.mkdir(parents=True, exist_ok=True)
-    metrics.parent.mkdir(parents=True, exist_ok=True)
+    validate_file_outputs((input_r1, input_r2), (output_r1, output_r2, metrics))
+    input_states = {path: file_stat_identity(path) for path in (input_r1, input_r2)}
+    from .read_fate import normalize_read_id
 
     total = 0
     kept = 0
     seed_counts = {seed: 0 for seed in CARLIN_5PRIME_SEEDS}
 
-    with open_binary(input_r1) as r1_in, open_binary(input_r2) as r2_in, gzip.open(
-        output_r1, "wb", compresslevel=1
-    ) as r1_out, gzip.open(output_r2, "wb", compresslevel=1) as r2_out:
-        while True:
-            r1 = read_fastq_record(r1_in)
-            r2 = read_fastq_record(r2_in)
-            if r1 is None and r2 is None:
-                break
-            if r1 is None or r2 is None:
-                raise ValueError("R1/R2 FASTQ record counts differ")
+    with atomic_output(metrics) as metrics_tmp, atomic_output(output_r2) as r2_tmp, atomic_output(output_r1) as r1_tmp:
+        with open_binary(input_r1) as r1_in, open_binary(input_r2) as r2_in, gzip.open(
+            r1_tmp, "wb", compresslevel=1
+        ) as r1_out, gzip.open(r2_tmp, "wb", compresslevel=1) as r2_out:
+            while True:
+                r1 = read_fastq_record(r1_in)
+                r2 = read_fastq_record(r2_in)
+                if r1 is None and r2 is None:
+                    break
+                if r1 is None or r2 is None:
+                    raise ValueError("R1/R2 FASTQ record counts differ")
+                if normalize_read_id(r1[0]) != normalize_read_id(r2[0]):
+                    raise ValueError("R1/R2 read-ID mismatch before RNA DARLIN prefilter")
 
-            total += 1
-            sequence = r1[1].strip().upper()
-            matched = [seed for seed in CARLIN_5PRIME_SEEDS if _rna_prefilter_seed_hit(sequence, seed)]
-            if not matched:
-                continue
+                total += 1
+                sequence = r1[1].strip().upper()
+                matched = [seed for seed in CARLIN_5PRIME_SEEDS if _rna_prefilter_seed_hit(sequence, seed)]
+                if not matched:
+                    continue
 
-            kept += 1
-            for seed in matched:
-                seed_counts[seed] += 1
-            r1_out.write(b"".join(r1))
-            r2_out.write(b"".join(r2))
+                kept += 1
+                for seed in matched:
+                    seed_counts[seed] += 1
+                r1_out.write(b"".join(r1))
+                r2_out.write(b"".join(r2))
 
-    with metrics.open("w") as handle:
-        handle.write("sample\ttotal_reads\tkept_reads\tkept_fraction\tseed\tseed_reads\n")
-        fraction = kept / total if total else 0.0
-        for seed, count in seed_counts.items():
-            seed_name = seed.decode("ascii")
-            handle.write(f"{args.sample}\t{total}\t{kept}\t{fraction:.8f}\t{seed_name}\t{count}\n")
+        with metrics_tmp.open("w") as handle:
+            handle.write("sample\ttotal_reads\tkept_reads\tkept_fraction\tseed\tseed_reads\n")
+            fraction = kept / total if total else 0.0
+            for seed, count in seed_counts.items():
+                seed_name = seed.decode("ascii")
+                handle.write(f"{args.sample}\t{total}\t{kept}\t{fraction:.8f}\t{seed_name}\t{count}\n")
+        assert_file_states_unchanged(input_states)
+        # 两个 FASTQ 开始替换前撤旧完成证据，全部成功后由最外层提交 metrics。
+        metrics.unlink(missing_ok=True)
 
     print(f"sample={args.sample}")
     print(f"total_reads={total}")
@@ -521,6 +600,8 @@ def write_rna_whitelist_main(argv: Sequence[str] | None = None) -> int:
     group.add_argument("--design-whitelist", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
+
+    validate_file_outputs((args.barcode_map or args.design_whitelist,), (args.output,))
 
     if args.design_whitelist is not None:
         values = load_droplet_whitelist(args.design_whitelist)

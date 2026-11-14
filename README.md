@@ -1,6 +1,8 @@
 # Lemmus
 
-当前版本为Git tag `v6.3`，正式发行包以包内README为准。源码计算位于`core/lemmus/`，下游实现归其`downstream/`子包，顶层`downstream/`只承载Notebook。
+本仓为公开运行包；开发文档、测试和维护规范由相应私有开发仓提供。
+
+正式版本由 Git tag 与对应 Release 定义。源码计算位于`core/lemmus/`，下游实现归其`downstream/`子包，顶层`downstream/`只承载Notebook。
 
 Cabernet和Droplet都固定使用 **PG（parsimony-gene）＋物种对应45S竞争参考**。PG拒绝残余多gene歧义，不运行EM，也不将原始分子数取整。支持hg38（人NR_146144.1）与mm10（小鼠NR_046233.2），固定序列及来源见 [45S参考](resources/rrna/README.md)。技术feature `RRNA45S_COMPETITOR` 的计数单独保存在obs/uns；`biological.h5ad`、细胞调用及下游表达不含该feature。它不是生物学单拷贝gene；零技术计数不能证明没有rRNA污染。
 
@@ -10,7 +12,7 @@ Cabernet和Droplet都固定使用 **PG（parsimony-gene）＋物种对应45S竞�
 
 本版本采用上述策略；已有其它resolution配置需在Pipeline外明确调整，旧index须用Doctor重建，历史结果不自动重算或覆盖。
 
-Lemmus v6.3（原 RNA_DARLIN_Pipeline）是从 Camellia 拆出的独立 RNA + targeted DARLIN workflow，基于 Snakemake。它可以完成：
+Lemmus（原 RNA_DARLIN_Pipeline）是从 Camellia 拆出的独立 RNA + targeted DARLIN workflow，基于 Snakemake。它可以完成：
 
 - RNA：Cabernet 3′ 与 DD-MET5 Droplet RNA 独立调用和定量（simpleaf 单一 backend）；
 - DARLIN：targeted lineage barcode 的 streaming 提取、UMI 级等位基因共识与 directional clone denoising；
@@ -26,14 +28,20 @@ core/run_pipeline.sh  创建项目、检查输入并运行分析
 
 Cabernet RNA 路径按标准 TSO-based 3′ UMI scRNA-seq 处理，不再保留 STAR / featureCounts / RNA UMI-tools legacy backend；Git history 负责版本回退。
 
-公开仓库发布可安装的正式版本；开发规范、完整回归和实验记录由私有开发仓库维护。运行代码、Doctor、固定资源与下游 Notebook 随本仓库发布。
+| 查阅内容 | 文档 |
+| --- | --- |
+| 配置、QC 阈值、DNA/RNA 关联与 doublet 参数 | [分析参数](https://github.com/Felix-owo/Lemmus_dev/blob/main/docs/ANALYSIS_PARAMETERS.md) |
+| 科学身份、输出与失败边界 | [维护规范](https://github.com/Felix-owo/Lemmus_dev/blob/main/AGENTS.md) |
+| DARLIN 提取实现与参考 | [处理说明](https://github.com/Felix-owo/Lemmus_dev/blob/main/docs/contracts/darlin-design.md)、[参考契约](resources/DARLIN_REFERENCE.md) |
+| 实测、失败与版本验收 | [实验记录](https://github.com/Felix-owo/Lemmus_dev/blob/main/docs/BENCHMARKS.md) |
 
-本项目沿用 Alopex 的 GNU GPL v3 许可，见 [LICENSE](LICENSE)。
+Lemmus_dev 完整发行包包含全部受版本控制的源码、Doctor、Notebook、docs、tests 和开发规范；公开 Lemmus 的运行包排除开发内容。Conda、生成参考、科学结果与未跟踪日志均不入包；开发仓需要相应访问权限。
+
+
 
 项目运行的临时工作与提交文件统一使用本项目 `05_tmp/`，包括预处理、原生工具 spill、诊断、矩阵写出和发布候选；外部 `TMPDIR` / `SLURM_TMPDIR` 不改选节点盘。临时文件关闭并校验后使用同文件系统原子替换；`05_tmp` 不得为符号链接，输出位于另一挂载时明确失败，不回退复制覆盖。仅清理本次创建的临时项，重试所需的事务备份也保留在 `05_tmp/`，运行或恢复未完成时不要手动清空该目录。
 
 `02_work/` 中有明确下游消费者的阶段产物、`.snakemake/` 恢复状态，以及没有项目上下文的环境/参考安装事务保留各自职责位置。安装事务的临时项必须与安装目标处于同一文件系统，不写入任意分析项目。共享空间和配额仍需足以容纳已有结果、新候选及并发作业；空间检查不等于容量预留。
-
 
 ## 全流程
 
@@ -53,18 +61,10 @@ Cabernet RNA 路径按标准 TSO-based 3′ UMI scRNA-seq 处理，不再保留 
 
 ## 1. 从 GitHub 下载 Pipeline
 
-从 [v6.3 Release](https://github.com/Felix-owo/Lemmus/releases/tag/v6.3) 下载 `Lemmus-v6.3.tar.gz` 和 `SHA256SUMS`，校验后解压：
+使用正式 tag 获取代码：
 
 ```bash
-shasum -a 256 -c SHA256SUMS
-tar -xzf Lemmus-v6.3.tar.gz
-cd Lemmus-v6.3
-```
-
-也可使用正式 tag 获取代码：
-
-```bash
-git clone --branch v6.3 --single-branch https://github.com/Felix-owo/Lemmus.git
+git clone --branch v6.17 --single-branch https://github.com/Felix-owo/Lemmus.git
 cd Lemmus
 ```
 
@@ -111,11 +111,9 @@ HPC 标准顺序与 Alopex 一致：
 2. 在登录节点提前下载和准备 Conda 等依赖。运行 `bash core/doctor.sh conda` 准备环境及固定白名单，再运行 `bash core/doctor.sh atlas` 准备 Census model、基因映射、当前参数的 balanced reference embedding 和 Cell Ontology；正确资源原样复用。
 3. 在**现有 JupyterLab 的 Terminal** 中进入 Pipeline 根目录，运行 `bash core/doctor.sh`。完整 Doctor 与科学调用在 Jupyter 的原 allocation 中执行，不在登录节点运行，不另起独立 Doctor allocation。
 
-已建环境的检查只读核对安装版本、平台和必需程序，不重复导入 Atlas 科学模块或启动 R 查询版本；创建时仍完整验证，后续参考、自检和 DAG 检查照常执行。
+已建环境的检查只读核对安装版本、平台和必需程序，不重复导入 Atlas 科学模块或启动R查询版本；创建时仍完整验证，后续参考、自检和DAG检查照常执行。
 
-HPC 更新保留来源仓库的真实 `.git` 与历史，核对正式 tag、commit、工作树和逐文件 SHA256，先审查保留已有本地修改。
-
-普通部署只要求更新 Pipeline 后跑通标准 Doctor，不默认追加全仓开发回归或额外 benchmark。代理日志、沙箱和备份统一留在已授权的 `MethylTreeAgent` 工作根。
+普通部署只要求更新 Pipeline 后跑通标准 Doctor，不默认追加全仓开发回归或额外 benchmark。HPC 更新保留来源仓库的真实 `.git` 与历史，核对正式 tag、commit、工作树和逐文件 SHA256，先审查保留已有本地修改；不以新建空仓库代替来源历史。代理日志、沙箱和备份统一留在已授权的 `MethylTreeAgent` 工作根。
 
 本机无参 Doctor 准备并检查全部资源。HPC 计算节点无参 Doctor 只读检查预先准备的四环境、白名单与 Census 离线参考，复用或从本地输入构建 PG＋45S，检查 Cabernet/Droplet × hg38/mm10 四个完整 DAG、跨 Pipeline 身份和当前目录项目参考。缺资源、损坏或参数不匹配均非零退出，不跳过必需检查；配置模板只读，不修改已有项目配置或科学结果。
 
@@ -133,11 +131,13 @@ core/doctor.sh test           # 编译、配置/schema、运行自检与可用�
 
 rules 环境至少提供：Python、simpleaf、piscem、alevin-fry、umi_tools（仅 DARLIN 使用）、FastQC、MultiQC、Java。当前生产版本策略以可从 Bioconda 一致安装为优先（simpleaf 0.28 系列、piscem 0.22.1 系列、Lemmus patched alevin-fry 0.18.3（[来源与构建](resources/alevin-fry/README.md)））；版本升级必须同时验证 index-format compatibility 和 doctor smoke。
 
-Doctor 下载 Census model 时使用 atlas 环境自己的 AWS CLI 与 Python，不依赖登录 shell 的 Python。`resources/hg38_reference/census_2025-11-08_scvi/` 保存 `model.pt`、`census_gene_map.npz`、`census_2025-11-08_scvi_reference.npz`；`census_reference.json` 最后提交，绑定采样身份与各文件 size/SHA256。准备失败不发布完成标记，原有正确 reference NPZ 不重写。
+Doctor 下载 Census model 时使用 atlas 环境自己的 AWS CLI 与 Python，不依赖登录 shell 的 Python。`resources/hg38_reference/census_2025-11-08_scvi/` 保存 `model.pt`、`census_gene_map.npz`、`census_2025-11-08_scvi_reference.npz`；`census_reference.json` 最后提交，绑定采样身份与各文件 size/SHA256。固定模型另核源码 SHA256，下载候选通过后才替换；完整就绪参考原样复用。失效或未封存的派生数组从固定版本官方来源重建，不对旧内容补签；失败不发布新完成标记。当前 seal 使用 schema 2；旧 schema 1 曾允许无官方来源重签，必须在本机或登录节点运行 `bash core/doctor.sh atlas` 实际重建，不能只改 schema 或 hash。计算节点只读拒绝旧格式。
 
-`core/doctor.sh test` 不依赖Git或开发测试目录：执行Python compile、Shell语法、配置/schema、barcode纠正与整数H5AD写读自检；受管环境和reference存在时还执行两物种×两协议的Snakemake full-DAG dry-run；单独 test 缺依赖可明确跳过，无参 Doctor 要求全部四项通过。自检使用临时合成输入，不能替代原始数据的科学验收。
+在线准备的 S3 读取沿用本机已有 HTTP(S) 代理设置，并遵守绕过规则；无代理时使用原有默认网络配置。计算节点仍只做离线核验和分析。网络设置不进入科学参考身份，TLS、checksum 与原有传输限时保持。
 
-`doctor.sh test` 的末步只读核对同级 `../Alopex`（可用 `DNA_PIPELINE_ROOT` 指定实际安装根目录）：Cabernet 比较两个 `resources/Barcode_Map.csv` 的 `(PlateID, RNA_Barcode, Cell_Order)` 字符串投影；使用 CSV 解析，表头去 BOM/外围空白并忽略大小写，拒绝空表、重复身份和损坏行。Droplet 比较 Lemmus `resources/droplet/U3CB_methylation.txt.gz` 与 Alopex `resources/droplet_ME5_U3CB_methylation.txt.gz`，两者必须匹配固定 ME5 SHA256。默认 Alopex 未安装时告警并标记未验证；显式根目录为空/不存在、已安装 Alopex 缺少孔板表、映射冲突或已有设计文件损坏均失败。Droplet 设计尚未准备时仅该项告警未验证（Lemmus 使用 `doctor.sh calling` 准备）；检查不构建环境、不运行 DNA doctor、不修改两侧资源。
+`core/doctor.sh test` 不依赖Git或开发测试目录：执行Python compile、Shell语法、配置/schema、barcode纠正与整数H5AD写读自检；受管环境和reference存在时还执行两物种×两协议的Snakemake full-DAG dry-run；单独 test 缺依赖可明确跳过，无参 Doctor 要求全部四项通过。自检使用临时合成输入，不能替代原始数据的科学验收。开发回归在源码checkout中单独执行：`PYTHONPATH=core conda/current/rules/bin/python -m unittest discover -s tests -p 'test_*.py'`，下游专用环境另用atlas解释器执行。
+
+`doctor.sh test` 的末步只读核对同级 `../Alopex`（可用 `DNA_PIPELINE_ROOT` 指定实际安装根目录）：Cabernet 比较两个 `resources/Barcode_Map.csv` 的 `(PlateID, Cell_Order)` 字符串投影，并分别核对 Lemmus 的 `RNA_Barcode` 和 Alopex 的 `DNA_Barcode` 非空且唯一（两者是不同的条码域，不互相比值）；使用 CSV 解析，表头去 BOM/外围空白并忽略大小写，拒绝空表、重复身份和损坏行。Droplet 比较 Lemmus `resources/droplet/U3CB_methylation.txt.gz` 与 Alopex `resources/droplet_ME5_U3CB_methylation.txt.gz`，两者必须匹配固定 ME5 SHA256。默认 Alopex 未安装时告警并标记未验证；显式根目录为空/不存在、已安装 Alopex 缺少孔板表、映射冲突或已有设计文件损坏均失败。Droplet 设计尚未准备时仅该项告警未验证（Lemmus 使用 `doctor.sh calling` 准备）；检查不构建环境、不运行 DNA doctor、不修改两侧资源。
 
 Doctor 的 PASS 与告警未验证应分别核对；跨 Pipeline 检查通过仅证明共享身份资源一致，正式项目仍需通过输入、reference 与 DAG 检查。
 
@@ -190,9 +190,9 @@ droplet:
 | 配置 | Droplet 含义 |
 | --- | --- |
 | `RNA.reference` | 按真实物种填写；模板为 `hg38`，reference 固定来自 Pipeline `resources/<species>_reference/pg45s/`。 |
-| `RNA.cores` | local 总 CPU 预算，模板 16。 |
-| `RNA.quant_threads` | 可选定量线程预算，缺省等于 cores，范围 `1..cores`。 |
-| `RNA.mem_mb` / `RNA.runtime` | 定量资源，模板为 49152 MiB / 720 分钟；local 并发同时受 cores 和 mem_mb 约束。 |
+| `RNA.cores` | local 总 CPU 预算，至少 2，模板 16。 |
+| `RNA.quant_threads` | 可选定量线程预算，缺省等于 cores，范围 `2..cores`。 |
+| `RNA.mem_mb` / `RNA.runtime` | 定量资源，模板为 49152 MiB / 720 分钟。macOS Droplet 的 `RNA.mem_mb` 也约束本机并发，须至少为 8192 以满足固定预处理申请。 |
 
 Droplet 固定保留背景（min_reads=1）、使用 rc 方向与 PG 分子解析，并禁用 DARLIN 和可选 read-fate 全表。这些是内部策略，不是配置项；`droplet:` 只接受可调 RNA 字段，不包含 `barcode_map`、`DARLIN` 或 `QC`。两种方案均不接受模块内的 `RNA.resolution`，PG 固定由程序提供。
 
@@ -219,8 +219,8 @@ cabernet:
 | --- | --- |
 | `RNA.reference` | 按真实物种填写；模板为 `mm10`，reference 固定来自 Pipeline `resources/<species>_reference/pg45s/`。 |
 | `barcode_map` | canonical whitelist 与 PlateID 映射来源，模板为 `00_config/Barcode_Map.csv`。 |
-| `RNA.cores` | local 总 CPU 预算，模板 16，不被 Slurm controller 的 local core 设置截断。 |
-| `RNA.quant_threads` | 可选定量线程预算，缺省等于 cores，范围 `1..cores`；显式调低可留出并发 DARLIN 所需的核。 |
+| `RNA.cores` | local 总 CPU 预算，至少 2，模板 16，不被 Slurm controller 的 local core 设置截断。 |
+| `RNA.quant_threads` | 可选定量线程预算，缺省等于 cores，范围 `2..cores`；显式调低可留出并发 DARLIN 所需的核。 |
 | `RNA.mem_mb` / `RNA.runtime` | 定量资源，模板为 16384 MiB / 720 分钟。 |
 | `RNA.min_reads` | canonical whitelist 的原生 permit-list read 门槛，默认 10。 |
 | `RNA.expected_orientation` | 接受 `fw` / `rc` / `both`，默认 `both`；改成 rc 不会改变 Cabernet 读端结构。 |
@@ -236,9 +236,11 @@ DARLIN 提取参数（`DARLIN.extraction.chunk_size` 等）的默认值集中定
 
 ### Barcode_Map.csv
 
+表头列名须非空、唯一且不带边缘空白，每行字段数与表头相同；`RNA_Barcode`、`PlateID`、`Cell_Order`各自唯一。项目manifest采用相同结构检查，空字段须显式留出分隔符；合法`NA`、前导零、引号字段与附加metadata列保留。whitelist导出禁止覆盖源Barcode_Map或压缩design。
+
 Cabernet 的 `Barcode_Map.csv` 是 canonical cell-barcode whitelist 与 PlateID 映射来源：
 
-- 列固定为 `DNA_Barcode`、`RNA_Barcode`、`PlateID`、`Cell_Order`；
+- Lemmus 必需列为 `RNA_Barcode`、`PlateID`、`Cell_Order`；Alopex 的 DNA 条码独立保存，不要求本表包含 `DNA_Barcode`；
 - RNA Cell Barcode 长度由该表自动推断，只允许 8 bp 或 10 bp；UMI 固定 8 bp；
 - barcode 只能包含 `A/C/G/T`；
 - 同长度 barcode 的最小两两 Hamming distance 必须 > 2，否则加载即拒绝（保证 unique Hamming-1 纠错无歧义）；
@@ -261,6 +263,8 @@ Cabernet 的 `Barcode_Map.csv` 是 canonical cell-barcode whitelist 与 PlateID 
 ```
 
 RNA 和 DARLIN 均递归扫描子目录，支持 `<sample>_1.fq.gz` / `<sample>_2.fq.gz`、`<sample>_R1[_001].fastq.gz` / R2、`<sample>_L001_R1_001.fastq.gz` / R2 和 `<sample>.R1.raw.fastq.gz` / R2；扩展名均可为 `.fq.gz` 或 `.fastq.gz`。无需重命名供应商文件；移除上述读端后缀后得到原始文库名。每个文库必须恰好一对文件，缺 mate、重复读端（包括多个 lane）或不支持的 FASTQ 名称均报错。
+
+`--refresh-manifest` 使用已有配置的 RNA／DARLIN 输入目录及 manifest 路径，保留项目样本名、额外 metadata 列和原列顺序。配置非法或刷新期间 config／manifest 被改动时拒绝提交，保留现有文件；恢复一致输入后重试。路径支持相对项目根、绝对路径和 `~`，默认目录中的旧数据不会混入已选来源。
 
 Cabernet 文库为 R1 = cDNA、R2 = Cell Barcode + UMI；DD-MET5 Droplet 为 R1 = CB17 + UMI12、R2 = 表达序列。
 
@@ -305,7 +309,13 @@ raw R1/R2
 
 DARLIN targeted library 保持独立处理：按 sample 对 paired FASTQ 单次 streaming 解析，以 `DARLIN.extraction.chunk_size`（默认 100,000 reads）分块同时评估全部配置的 templates，不为每个 template 重复读取 FASTQ。流式内存有界（read-ID inventory 流、8 字节重复检测哈希、sidecar 按 read ordinal 对接），常驻内存只随分子多样性而非 read 总数增长。提取 rule 前置 `assert-fastq` 门禁，损坏/截断的 FASTQ 秒级失败。primer-variant 决策（`use_short_3prime`）每 sample/template 只做一次并在后续 chunk 不一致时 fail closed。Cell barcode 与 RNA 路径统一：exact match 优先，其后仅允许 unique Hamming-1 rescue，多个 whitelist 邻居的 barcode fail-closed。**UMI 级等位基因共识**在 read cutoff 之前把同一 cell+UMI 的近同源序列变体合并到同一分子（read 支持相加）并同步重映射 read-level 证据；Clone-sequence directional clustering 使用 `umi_tools.UMIClusterer`，但严格限定在单个 biological cell 内。`umi_tools` 依赖仅用于 DARLIN，不参与 RNA quantification。
 
+DARLIN 来源角色由当前 manifest 显式确定，项目名含 `__RNA` 不代表 RNA rescue。barcode 表和 metrics 必须带当前 `manifest_source_roles_v1` 来源契约；缺少该契约的旧结果须通过正常 Pipeline 重跑提取、merge 和 clone producer。DAG 参数触发重算，不手工补列或改签旧表。canonical 细胞只按项目 `sample_id` 与 Barcode Map 解析，保留 `NA`／前导零身份。
+
+DARLIN 持久表拒绝重复／空白表头、行宽错误及非法 reads／UMIs；不自动改列名、补零或截断小数。遇到此类错误须检查真实输入并重跑对应 producer，不手工修饰计数以通过验收。
+
 ## 8. 数据产出与完成确认
+
+下列布局以默认 `paths.results_root: 03_results` 为例；RNA、DARLIN 与生产 QC 实际使用配置选定的结果根。相对路径以项目根解析，支持绝对和 `~` 路径，不读取默认目录的残留结果，也不自动搬迁旧数据。下游输出仍固定为项目 `06_downstream/`。
 
 Cabernet 的主要结果位于下表。Droplet 的正式矩阵同样为 `03_results/count/<sample_id>/RNA.h5ad`，原始定量和 mapping 指标位于 `02_work/rna_core/droplet_quant/<sample_id>/`，不产生 DARLIN 输出：
 
@@ -327,24 +337,38 @@ Cabernet 的 `RNA.h5ad.obs_names` 固定为 `<sample_id>_<PlateID>`；Droplet �
 
 `parsimony-gene` 输出原生整数分子数，不做多gene EM或手动取整。`n_genes_supported`（至少1分子）是正式RNA QC主复杂度指标；positive/fractional/subunit审计字段保留其数值定义，正常PG输出的fractional/subunit应为0。技术45S计数不会进入表达分母。`quants.h5ad` 仅作为投影输入的临时工件，成功写出 `biological.h5ad` 后由Snakemake回收；后者保留全部背景barcode供独立calling和恢复。
 
+calling和finalize只接收prepared PG整数生物矩阵，未调用的背景细胞也须合法。calling QC绑定背景H5AD与调用表的SHA256；来源不符或处理期间输入变化时拒绝发布。常规launcher会按更新的固定calling契约重算对应calling/finalize；单独调用finalize遇到identity错误时须先重跑calling生产者，不手工补哈希或为旧EM矩阵改标签。显式存储的零不计作检出基因，输入矩阵不改写。
+
 MultiQC 汇总五类证据：FastQC 由 MultiQC 原生模块解析；`RNA.h5ad` 生成 RNA expression summary；simpleaf 的 `map_info.json` / `quant.json` 以保留原始 JSON key path 的 custom-content table 展示；启用 DARLIN 时加入最终 clone table 的 DARLIN QC section、barcode correction 指标（exact / Hamming-1 corrected / ambiguous / unmatched reads 与 correction fraction）和 RNA/DARLIN cell alignment 审计。
 
-下游合并必须保留 `RNA.h5ad.var` 中的 `gene_id` 与 `gene_symbol`：版本化 Ensembl ID 作为稳定索引，MT/IG QC 和 marker 解释使用 `gene_symbol`。主注释 H5AD 通过同目录临时文件原子发布，写入失败不会破坏旧结果。
+Cabernet 可选的 `QC.read_fate.enabled` 默认关闭；启用后在所选结果根 `QC_Results/` 写逐 read TSV、summary 与 checksum。RNA_ASSIGNED 只表示 exact whitelist gate，不表示 gene/UMI 定量成功。采集和合并会在初读前及候选写完后核输入身份，变化时保旧失败；来源一致后重跑，不手工补签 checksum。表头、行宽或引号损坏须先处理来源，不能依赖自动补字段。 ledger/evidence/sidecar 的 canonical read_id 必须与 raw inventory 逐字匹配，不再执行 header/mate 规整，以免把真实 `read/1` 改成 `read`。Droplet 固定禁用该全表。
 
-最终必需的非空文件：
+下游合并必须保留 `RNA.h5ad.var` 中的 `gene_id` 与 `gene_symbol`：版本化 Ensembl ID 作为稳定索引，MT/IG QC 和 marker 解释使用 `gene_symbol`。主注释 H5AD 通过项目 `05_tmp/` 中同文件系统的临时文件原子发布，写入失败不会破坏旧结果。
+
+最终必需的非空文件（默认结果根示例）：
 
 ```text
 03_results/QC_Results/multiqc_report.html
 03_results/count/<sample_id>/RNA.h5ad
 ```
 
-启用 DARLIN 时，另须生成 `03_results/DARLIN/DARLIN_clone_id/DARLIN_Clone_ID.csv`。
+启用 DARLIN 时，另须生成 `03_results/DARLIN/DARLIN_clone_id/DARLIN_Clone_ID.csv`。禁用 DARLIN 后，下游不消费或绑定该路径的残留 clone 表；重新启用后重新核对当前输入。输入在 merge／clone 计算或候选写入期间发生变化时拒绝提交，恢复一致输入后重跑，不手工更新 checksum。
 
 ## 下游分析
 
-下游 Processor 负责计算，Notebook 负责调参与可视化。使用 Doctor 管理的 `conda/current/atlas` 环境，输入为 finalized `03_results/count/<sample_id>/RNA.h5ad`；细胞身份已在 finalize 阶段生成，Notebook 不重复重命名。
+下游 Processor 负责计算，Notebook 负责调参与可视化。使用 Doctor 管理的 `conda/current/atlas` 环境，输入为配置结果根下的 finalized `count/<sample_id>/RNA.h5ad`（默认 `03_results`）；Notebook 由项目 `00_config/config.yaml` 定位，不要求默认 count 目录存在。显式项目路径失效、最近配置非普通文件或不可读取时失败，不转读祖先项目。细胞身份已在 finalize 阶段生成，Notebook 不重复重命名。
 
 ### QC 与完整注释
+
+下游先完整验证项目配置，包括未选模块，再选择协议和实际路径；非法类型、固定字段、未知键或缺失必填项直接失败，不补字段或改写配置。QC-only与`--analyze`使用同一读取链。
+
+QC-only复用会核对QC表、Droplet全细胞metrics及完整分析注释H5AD的完成哈希。产物被替换或缺失时重算QC、撤下失效注释；原始输入未变时保留已用QC阈值。需要聚类/注释时再执行`--analyze`。
+
+human 注释另绑定 Census model、gene map、embedding、seal 和 ontology 的 SHA256。参考更新或缺失时，QC-only 撤下旧注释并保留可复用 QC 和阈值；无需准备模型才能运行普通 QC。需要新注释时先在登录节点准备参考，再执行 `--analyze`。完整分析在输出提交前复核参考未变，来源同时保存在分析摘要及 H5AD。
+
+下游同时核对实际 barcode／孔位／顺序、精确 cell ID 和 library，DARLIN 关联还须匹配当前 Barcode Map 的 SHA 与记录数；细胞名集合相同也不能批准旧 map 来源。manifest／map／results_root 使用现有配置选定的路径，默认目录中的残留文件不参与下游身份。QC 缓存绑定实际选择的 RNA 和启用的 clone 表，所选输入变化时重建，不能因细胞名或总计数相同而沿用旧 QC。 `06_downstream/sample_manifest.tsv` 也只复制该实际清单的原字节，保留额外 metadata 与格式；默认清单缺席或残留不影响所选来源。来源不符时重跑实际 producer，不手工改签旧表。
+
+下游读取`RNA.h5ad`时逐文库核对原始PG整数计数和gene_id轴身份；完整gene集合不一致、分数或非有限值须返回当前producer重算，不自动补零、取整或迁移旧结果。RNA Scrublet在首个文库拟合前校验所有输入。
 
 ```bash
 PIPELINE=/path/to/Lemmus
@@ -359,6 +383,10 @@ PYTHONPATH="$PIPELINE/core" "$PIPELINE/conda/current/atlas/bin/python" \
 
 需要 DNAme 整合时，在命令中加入 `--dna-project-root /path/to/DNA_project`。完整注释也可运行 [RNA_QC_Visualization.ipynb](downstream/RNA_QC_Visualization.ipynb)，通过 `QC_THRESHOLDS` / `ANALYSIS_OVERRIDES` 配置 Processor。
 
+QC 与完整分析只写所选项目的 `06_downstream/`；CLI 和 Python API 均不接受另选输出根。切换项目须选择其 `--project-dir`，不能借用另一项目的下游目录。历史目录不自动搬迁或清理。
+
+升级 Pipeline 源码后重启 Notebook 内核。相同路径中的旧模块也不能继续计算并记录新源码身份；单独 reload 包根不能替代重启。命令行每次使用新进程，无需这项手工操作。 若报告 `bytecode differs from scientific source`，仅移除错误指出的过期 `.pyc`，再重启内核或启动新进程；只重启进程不能消除仍被 Python 认作有效的旧缓存。
+
 | 输出（`06_downstream/`） | 使用边界 |
 | --- | --- |
 | `RNA_QC_Information.csv` | 固定13列；`CloneID` 为 RNA library 身份，未运行分析或未通过 QC 时注释列为空 |
@@ -367,9 +395,11 @@ PYTHONPATH="$PIPELINE/core" "$PIPELINE/conda/current/atlas/bin/python" \
 | marker / 审计 CSV | 支持注释解释与检查；完整 DARLIN 证据仍在 `03_results/DARLIN/DARLIN_clone_id/DARLIN_Clone_ID.csv` |
 | `analysis_summary.json` | 实际参数、seed、依赖版本与输入哈希 |
 
-human 使用 Census scVI consensus；小鼠使用 deterministic marker-program 注释，低支持保留 `Uncertain` / `Unresolved`。正式 broad 标签为 `cell_type_final`；样品名与来源用于审计，不作为注释先验。
+human 使用 Census scVI consensus；小鼠使用 deterministic marker-program 注释，低支持保留 `Uncertain` / `Unresolved`。正式 broad 标签为 `cell_type_final`；样品名与来源用于审计，不作为注释先验。具体 marker、fine-label 与确定性规则见[输出合同](https://github.com/Felix-owo/Lemmus_dev/blob/main/docs/contracts/downstream.md#8-输出合同)。
 
-Droplet QC-only CLI 支持 `--min-genes-per-cell`、`--min-counts-per-cell`。MT% 仅保留为诊断指标，不参与剔除；线粒体基因及原始计数保留。阈值只更新下游 `qc_pass`，不修改分子计数矩阵或重新调用细胞；未传参数时沿用已保存的 QC 设置。已有聚类/注释结果时，修改阈值会撤销失效注释及其完成标记；需要注释时再用 `--analyze` 在原位置重建。实际参数以 Notebook 配置和 Processor 的 `--help` 为准。
+小鼠 marker-program 从原始 counts 层判断 ≥1 UMI 检出，避免细胞总分子数改变归一化后的检出门槛。更新后重新 `--analyze` 生成小鼠注释，无需为该修复重跑 reads 定量。
+
+Droplet QC-only CLI 支持 `--min-genes-per-cell`、`--min-counts-per-cell`。MT% 仅保留为诊断指标，不参与剔除；线粒体基因及原始计数保留。阈值只更新下游 `qc_pass`，不修改分子计数矩阵或重新调用细胞；未传参数时沿用已保存的 QC 设置。已有聚类/注释结果时，修改阈值会撤销失效注释及其完成标记；需要注释时再用 `--analyze` 在原位置重建。阈值范围、默认值与分母见[分析参数](https://github.com/Felix-owo/Lemmus_dev/blob/main/docs/ANALYSIS_PARAMETERS.md#下游分析processor---analyze)。
 
 ### Droplet QC 与 doublet Notebook
 
@@ -382,7 +412,7 @@ Droplet QC-only CLI 支持 `--min-genes-per-cell`、`--min-counts-per-cell`。MT
 | 调整倍率 | 实际阈值为自动阈值×倍率，严格大于才判阳性；减小倍率会增加剔除，也可能误标正常细胞。失败或低信息不当作 singlet |
 | 最后一格 | 导出全部 DNA 的 SingleCpG 副本，保留原矩阵/身份/注释，加入 DNA20、`RNA_` 前缀 RNA13 和独立/联合 doublet 判定；DNA-only 的 RNA QC 留空 |
 
-整合结果位于 `06_downstream/droplet_integration/`，DNA 判定与 SingleCpG 位于其 `dna_doublet/`。summary 最后提交；调整输入或参数后覆盖固定位置的对应结果。续跑 DNA doublet/SingleCpG 导出前会复核当前 sealed 文库关联，失配时须重新整合。配置入口见上述 Droplet Notebook。
+整合结果位于 `06_downstream/droplet_integration/`，DNA 判定与 SingleCpG 位于其 `dna_doublet/`。summary 最后提交；DNA 判定 CSV 写完后会再次复验全部来源和 DNA 完成身份，变化则拒绝完成，来源一致后重跑。调整输入或参数后覆盖固定位置的对应结果。续跑 DNA doublet/SingleCpG 导出前会复核当前 sealed 文库关联，失配时须重新整合。输出文件、算法参数、环境依赖与可空联合 OR 规则见[Droplet Notebook 参数](https://github.com/Felix-owo/Lemmus_dev/blob/main/docs/ANALYSIS_PARAMETERS.md#droplet-notebookqc-与-doublet-专用入口)。
 
 ### DNA/RNA 文库关联
 
@@ -394,7 +424,7 @@ Droplet QC-only CLI 支持 `--min-genes-per-cell`、`--min-counts-per-cell`。MT
 | SRD | DNA `rna_sample` 是本地 RNA tube，不用于外部桥接；按共享项目样本名与 PlateID 连接 |
 | Droplet | 通过 sealed `rna_sample` 连接文库，再按完整 CB17 精确连接；留空保持未关联，双方独有细胞保留在 `DNA_RNA_cell_links.csv`，不补零表达 |
 
-关联只读当前 complete DNA 的 sealed manifest 和同代 QC，不读取可变 config 或按 mtime 挑目录。修改关联后须重新发布 DNA、生成同代 downstream QC，再重跑 RNA 整合。`Integrated_QC_Information.csv` 保留 RNA 身份与实际映射溯源；RNA13/DNA20 的独立 QC schema 不变。
+关联只读当前 complete DNA 的 sealed manifest 和同代 QC，不读取可变 config 或按 mtime 挑目录。修改关联后须重新发布 DNA、生成同代 downstream QC，再重跑 RNA 整合。`Integrated_QC_Information.csv` 保留 RNA 身份与实际映射溯源；RNA13/DNA20 的独立 QC schema 不变。详细校验见[跨项目关联](https://github.com/Felix-owo/Lemmus_dev/blob/main/docs/ANALYSIS_PARAMETERS.md#dnarna-跨项目关联)。
 
 ## 常见问题
 
@@ -415,7 +445,7 @@ core/doctor.sh test
 
 ## DD-MET5 RNA 快速配置
 
-依次完成[初始化 Droplet 项目](#dd-met5-droplet-项目)、[检查 Droplet 配置](#dd-met5-droplet-配置)、[导入 FASTQ](#6-准备-raw-fastq-和-sample-manifest)及 dry-run，再正式运行。RNA 独立 calling 与定量完成后，按[下游关联步骤](#dnarna-文库关联)准备 DNA sealed 关联和同代 QC，运行 CLI 或专用 Notebook。
+依次完成[初始化项目并选择 Droplet](#4-创建分析项目)、[检查 Droplet 配置](#dd-met5-droplet-配置)、[导入 FASTQ](#6-准备-raw-fastq-和-sample-manifest)及 dry-run，再正式运行。RNA 独立 calling 与定量完成后，按[下游关联步骤](#dnarna-文库关联)准备 DNA sealed 关联和同代 QC，运行 CLI 或专用 Notebook。
 
 ## v6 原生定量与预处理
 

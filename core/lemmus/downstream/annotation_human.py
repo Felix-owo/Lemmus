@@ -25,6 +25,7 @@ CENSUS_VERSION = "2025-11-08"
 SCVI_MODEL_URI = "s3://cellxgene-contrib-public/models/scvi/2025-11-08/homo_sapiens/model.pt"
 CELL_ONTOLOGY_URL = "https://purl.obolibrary.org/obo/cl/cl-basic.obo"
 SCVI_MODEL_SIZE = 931490141
+SCVI_MODEL_SHA256 = "7ce9666cc48f2ef6a77cfe48afad6950465be23e31d41559e3b616190c6dd0e4"
 CENSUS_GENE_MAP = "census_gene_map.npz"
 CENSUS_REFERENCE_SEAL = "census_reference.json"
 
@@ -32,6 +33,32 @@ CENSUS_REFERENCE_SEAL = "census_reference.json"
 def _require_download_host():
     if sys.platform.startswith("linux") and os.environ.get("SLURM_JOB_ID"):
         raise RuntimeError("Download preparation must run on the login node: bash core/doctor.sh atlas")
+
+
+def _census_read_context(bucket: str):
+    """The native S3 client does not inherit macOS system proxy settings."""
+    import cellxgene_census
+    from urllib.request import getproxies, proxy_bypass
+    from urllib.parse import unquote, urlsplit
+
+    settings = {}
+    proxies = getproxies()
+    proxy = proxies.get('https') or proxies.get('all')
+    if proxy and not proxy_bypass(f'{bucket}.s3.us-west-2.amazonaws.com'):
+        try:
+            parsed = urlsplit(proxy if '://' in proxy else 'http://' + proxy)
+            port = parsed.port if parsed.port is not None else 443 if parsed.scheme == 'https' else 80
+            if parsed.scheme not in ('http', 'https') or not parsed.hostname or not 0 < port < 65536:
+                raise ValueError
+        except ValueError:
+            raise ValueError('Census S3 requires a valid HTTP(S) system HTTPS proxy') from None
+        settings = {'vfs.s3.proxy_host': parsed.hostname, 'vfs.s3.proxy_port': str(port),
+                    'vfs.s3.proxy_scheme': parsed.scheme}
+        if parsed.username is not None:
+            settings['vfs.s3.proxy_username'] = unquote(parsed.username)
+        if parsed.password is not None:
+            settings['vfs.s3.proxy_password'] = unquote(parsed.password)
+    return cellxgene_census.get_default_soma_context(tiledb_config=settings)
 
 
 def _file_identity(path: Path) -> dict:
@@ -88,25 +115,31 @@ def _validate_reference_arrays(path: Path, expected: dict):
 
 def check_census_reference(model_dir: str | Path, expected: dict | None = None) -> dict:
     """Check the prepared local inputs without contacting Census or modifying files."""
+    from ..io import file_stat_identity
+
     model_dir = Path(model_dir)
     expected = _default_reference_meta() if expected is None else expected
     try:
         seal_path = model_dir / CENSUS_REFERENCE_SEAL
+        states = {seal_path: file_stat_identity(seal_path)}
         original = seal_path.read_bytes()
         seal = json.loads(original)
         cache_name = f"census_{expected['census_version']}_scvi_reference.npz"
         names = {"model.pt", CENSUS_GENE_MAP, cache_name}
-        if (seal["schema"] != 1 or seal["reference_meta"] != expected
+        states.update({model_dir / name: file_stat_identity(model_dir / name) for name in names})
+        # Schema 1 could adopt structurally valid arrays without verifying their source.
+        if (seal["schema"] != 2 or seal["reference_meta"] != expected
                 or set(seal["files"]) != names):
             raise ValueError("Census preparation identity mismatch")
         for name in sorted(names):
             if _file_identity(model_dir / name) != seal["files"][name]:
                 raise ValueError(f"Census prepared file changed: {name}")
-        if seal["files"]["model.pt"]["size"] != SCVI_MODEL_SIZE:
-            raise ValueError("Census scVI model size mismatch")
+        if seal["files"]["model.pt"] != {"size": SCVI_MODEL_SIZE, "sha256": SCVI_MODEL_SHA256}:
+            raise ValueError("Census scVI model identity mismatch")
         _read_local_gene_map(model_dir, expected["census_version"])
         _validate_reference_arrays(model_dir / cache_name, expected)
-        if seal_path.read_bytes() != original:
+        if (seal_path.read_bytes() != original
+                or any(file_stat_identity(path) != state for path, state in states.items())):
             raise ValueError("Census preparation changed during validation")
         return seal
     except (OSError, ValueError, KeyError, TypeError, BadZipFile) as exc:
@@ -117,46 +150,56 @@ def check_census_reference(model_dir: str | Path, expected: dict | None = None) 
 
 
 def prepare_census_reference(model_dir: str | Path):
-    """Login-node producer; Doctor owns the Atlas transaction lock and model download."""
+    """Login-node producer; Doctor owns the Atlas transaction lock."""
+    from ..io import file_stat_identity
+
     _require_download_host()
     model_dir = Path(model_dir)
     expected = _default_reference_meta()
-    if (model_dir / "model.pt").stat().st_size != SCVI_MODEL_SIZE:
-        raise ValueError("Census scVI model size mismatch")
+    try:
+        check_census_reference(model_dir, expected)
+    except RuntimeError:
+        pass
+    else:
+        return
+    download_scvi_model(model_dir)
+    try:
+        check_census_reference(model_dir, expected)
+    except RuntimeError:
+        pass
+    else:
+        return
     cache_name = f"census_{expected['census_version']}_scvi_reference.npz"
-    cache = model_dir / cache_name
+    model_state = file_stat_identity(model_dir / 'model.pt')
     with tempfile.TemporaryDirectory(prefix=".census.", dir=model_dir) as work:
         work = Path(work)
-        replacements = []
-        try:
-            _read_local_gene_map(model_dir, expected["census_version"])
-        except (OSError, ValueError, KeyError, TypeError, BadZipFile):
-            import cellxgene_census
-            with cellxgene_census.open_soma(census_version=expected["census_version"]) as census:
-                var = _census_var_map(census)
-            np.savez_compressed(
-                work / CENSUS_GENE_MAP,
-                meta=np.asarray(json.dumps({"census_version": expected["census_version"],
-                                           "organism": "Homo sapiens"}, sort_keys=True)),
-                feature_id=var["feature_id"].to_numpy(dtype=str),
-                feature_name=var["feature_name"].to_numpy(dtype=str),
-            )
-            _read_local_gene_map(work, expected["census_version"])
-            replacements.append(CENSUS_GENE_MAP)
-        try:
-            _validate_reference_arrays(cache, expected)
-        except (OSError, ValueError, KeyError, TypeError, BadZipFile):
-            params = {k: expected[k] for k in (
-                "census_version", "candidate_cells", "max_cells_per_type", "max_reference_cells",
-                "normal_only", "tissues", "seed", "metadata_block_size", "embedding_batch_size",
-            )}
-            build_reference_cache(work / cache_name, **params)
-            _validate_reference_arrays(work / cache_name, expected)
-            replacements.append(cache_name)
-        seal = {"schema": 1, "reference_meta": expected, "files": {
+        # Without a matching seal, valid shapes do not establish official provenance.
+        import cellxgene_census
+        with cellxgene_census.open_soma(census_version=expected["census_version"],
+                                      context=_census_read_context('cellxgene-census-public-us-west-2')) as census:
+            var = _census_var_map(census)
+        np.savez_compressed(
+            work / CENSUS_GENE_MAP,
+            meta=np.asarray(json.dumps({"census_version": expected["census_version"],
+                                       "organism": "Homo sapiens"}, sort_keys=True)),
+            feature_id=var["feature_id"].to_numpy(dtype=str),
+            feature_name=var["feature_name"].to_numpy(dtype=str),
+        )
+        _read_local_gene_map(work, expected["census_version"])
+        params = {k: expected[k] for k in (
+            "census_version", "candidate_cells", "max_cells_per_type", "max_reference_cells",
+            "normal_only", "tissues", "seed", "metadata_block_size", "embedding_batch_size",
+        )}
+        build_reference_cache(work / cache_name, **params)
+        _validate_reference_arrays(work / cache_name, expected)
+        replacements = [CENSUS_GENE_MAP, cache_name]
+        seal = {"schema": 2, "reference_meta": expected, "files": {
             name: _file_identity((work if name in replacements else model_dir) / name)
             for name in ("model.pt", CENSUS_GENE_MAP, cache_name)
         }}
+        if (seal['files']['model.pt'] != {'size': SCVI_MODEL_SIZE, 'sha256': SCVI_MODEL_SHA256}
+                or file_stat_identity(model_dir/'model.pt') != model_state):
+            raise ValueError('Census scVI model changed during reference preparation')
         (work / CENSUS_REFERENCE_SEAL).write_text(json.dumps(seal, indent=2) + "\n")
         # All candidates validate before withdrawing the old completion marker.
         (model_dir / CENSUS_REFERENCE_SEAL).unlink(missing_ok=True)
@@ -182,12 +225,22 @@ def download_scvi_model(model_dir: str | Path) -> Path:
     model_dir = Path(model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
     target = model_dir / "model.pt"
-    if not target.exists():
+    expected = {'size': SCVI_MODEL_SIZE, 'sha256': SCVI_MODEL_SHA256}
+    try:
+        if _file_identity(target) == expected:
+            return target
+    except FileNotFoundError:
+        pass
+    with tempfile.TemporaryDirectory(prefix='.model.', dir=model_dir) as work:
+        candidate = Path(work)/'model.pt'
         subprocess.run(
             ["aws", "s3", "cp", "--no-sign-request", "--no-progress",
-             SCVI_MODEL_URI, str(target)],
+             SCVI_MODEL_URI, str(candidate)],
             check=True,
         )
+        if _file_identity(candidate) != expected:
+            raise ValueError('Downloaded Census scVI model identity mismatch')
+        os.replace(candidate, target)
     return target
 
 
@@ -656,6 +709,7 @@ def _fetch_scvi_embeddings(
     total = len(ids)
     total_batches = max(1, (total + batch_size - 1) // batch_size)
     stage_t0 = time.perf_counter()
+    context = _census_read_context('cellxgene-contrib-public')
 
     embeddings: list[np.ndarray] = []
     obs_frames: list[pd.DataFrame] = []
@@ -678,6 +732,7 @@ def _fetch_scvi_embeddings(
             embedding_meta["census_version"],
             embedding_uri,
             batch_ids,
+            context=context,
         )
         arr = np.asarray(arr, dtype=np.float32)
 
@@ -755,7 +810,8 @@ def build_reference_cache(
         flush=True,
     )
 
-    with cellxgene_census.open_soma(census_version=census_version) as census:
+    with cellxgene_census.open_soma(census_version=census_version,
+                                  context=_census_read_context('cellxgene-census-public-us-west-2')) as census:
         _progress(1, f"Reading ~{candidate_cells:,} candidate cells from Census metadata...")
         obs = census["census_data"]["homo_sapiens"].obs
         meta = _sample_obs_blocks(obs, candidate_cells, metadata_block_size, seed)
@@ -835,137 +891,11 @@ def build_reference_cache(
     )
     return cache_path
 
-def _centroid_predict(Xr, yr, Xq):
-    from sklearn.preprocessing import normalize
-
-    labels = np.unique(yr)
-    centroids = np.vstack([Xr[yr == x].mean(axis=0) for x in labels])
-    centroids = normalize(centroids)
-    q = normalize(Xq)
-    sim = q @ centroids.T
-    p = np.exp((sim - sim.max(axis=1, keepdims=True)) / 0.08)
-    p /= p.sum(axis=1, keepdims=True)
-    return labels, p
-
-
-def _fit_predictors(Xr, yr, Xq, seed=42):
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.neighbors import KNeighborsClassifier
-    from sklearn.preprocessing import StandardScaler
-
-    scaler = StandardScaler()
-    Xrs = scaler.fit_transform(Xr)
-    Xqs = scaler.transform(Xq)
-
-    models = {
-        "knn_scvi": KNeighborsClassifier(n_neighbors=25, weights="distance", n_jobs=-1),
-        "logreg_scvi": LogisticRegression(
-            max_iter=600, class_weight="balanced", solver="lbfgs",
-        ),
-        "rf_scvi": RandomForestClassifier(
-            n_estimators=400, n_jobs=-1, random_state=seed,
-            class_weight="balanced_subsample", max_features="sqrt",
-        ),
-    }
-
-    out = {}
-    for name, model in models.items():
-        train = Xrs if name != "rf_scvi" else Xr
-        query = Xqs if name != "rf_scvi" else Xq
-        model.fit(train, yr)
-        out[name] = (model.classes_.astype(str), model.predict_proba(query))
-
-    out["centroid_scvi"] = _centroid_predict(Xr, yr, Xq)
-    return out
-
 
 def _normalize_cl_id(value: object) -> str:
     text = str(value or "")
     match = re.search(r"CL:\d{7}", text)
     return match.group(0) if match else ""
-
-
-def _ontology_consensus(
-    method_outputs: dict[str, tuple[np.ndarray, np.ndarray]],
-    ontology_map: dict[str, str],
-    parents: dict[str, tuple[str, ...]],
-    names: dict[str, str],
-    ancestor_weight: float = 0.60,
-):
-    methods = list(method_outputs)
-    n = next(iter(method_outputs.values()))[1].shape[0]
-    pred_table = pd.DataFrame(index=np.arange(n))
-    prob_table = pd.DataFrame(index=np.arange(n))
-
-    for method, (classes, prob) in method_outputs.items():
-        top = prob.argmax(axis=1)
-        pred_table[method] = classes[top]
-        prob_table[method] = prob[np.arange(n), top]
-
-    ancestor_cache, depth_cache = {}, {}
-    label_by_ontology = {}
-    for label, oid in ontology_map.items():
-        if oid:
-            label_by_ontology.setdefault(oid, label)
-
-    final_label, final_oid, agreement, mean_prob = [], [], [], []
-    ontology_score, ontology_margin, exact_votes, exact_vote_margin = [], [], [], []
-
-    for i in range(n):
-        labels = pred_table.iloc[i].astype(str).tolist()
-        probs = prob_table.iloc[i].to_numpy(float)
-        exact = pd.Series(labels).value_counts()
-        top_exact = str(exact.index[0])
-        top_votes = int(exact.iloc[0])
-        second_votes = int(exact.iloc[1]) if len(exact) > 1 else 0
-
-        scores = {}
-        for label in labels:
-            oid = ontology_map.get(label, "")
-            if not oid:
-                continue
-            scores[oid] = scores.get(oid, 0.0) + 1.0
-            for anc in _ancestors(oid, parents, ancestor_cache):
-                scores[anc] = scores.get(anc, 0.0) + ancestor_weight
-
-        if scores:
-            ranked = sorted(
-                scores.items(),
-                key=lambda kv: (kv[1], _depth(kv[0], parents, depth_cache), kv[0]),
-                reverse=True,
-            )
-            oid, score = ranked[0]
-            margin = score - (ranked[1][1] if len(ranked) > 1 else 0.0)
-            if top_votes >= 3:
-                label = top_exact
-                oid = ontology_map.get(label, oid)
-            else:
-                label = label_by_ontology.get(oid, names.get(oid, top_exact))
-        else:
-            label, oid, score, margin = top_exact, ontology_map.get(top_exact, ""), float(top_votes), 0.0
-
-        final_label.append(label)
-        final_oid.append(oid)
-        agreement.append(top_votes / len(methods))
-        mean_prob.append(float(probs.mean()))
-        ontology_score.append(float(score))
-        ontology_margin.append(float(margin))
-        exact_votes.append(top_votes)
-        exact_vote_margin.append(top_votes - second_votes)
-
-    result = pd.DataFrame({
-        "consensus_label": final_label,
-        "consensus_ontology_id": final_oid,
-        "method_agreement": agreement,
-        "mean_method_probability": mean_prob,
-        "ontology_score": ontology_score,
-        "ontology_margin": ontology_margin,
-        "exact_votes": exact_votes,
-        "exact_vote_margin": exact_vote_margin,
-    })
-    return result, pred_table, prob_table
-
 
 
 def _normalize_ensembl_gene_id(value: object) -> str:
@@ -1121,7 +1051,7 @@ def annotate_from_census_consensus(
     adata: anndata.AnnData,
     model_dir: str | Path,
     reference_cache: str | Path,
-    ontology_path: str | Path,
+    *,
     cluster_key: str = "leiden",
     census_version: str = CENSUS_VERSION,
     candidate_cells: int = 10_000_000,
@@ -1129,9 +1059,6 @@ def annotate_from_census_consensus(
     max_reference_cells: int = 500_000,
     normal_only: bool = True,
     tissues: tuple[str, ...] | None = None,
-    min_agreement: float = 0.50,
-    min_mean_probability: float = 0.35,
-    min_ontology_depth: int = 3,
     seed: int = 42,
     metadata_block_size: int = 500_000,
     embedding_batch_size: int = 50_000,
@@ -1139,8 +1066,6 @@ def annotate_from_census_consensus(
     uncertainty_threshold: float = 0.50,
     query_max_epochs: int = 200,
 ) -> ConsensusAnnotationResult:
-    # ontology_path/min_* are retained in the signature for notebook compatibility,
-    # but are not used as primary gates in the scArches paper workflow.
     reference_cache = Path(reference_cache)
 
     expected_cache_meta = _reference_cache_meta(
@@ -1978,23 +1903,6 @@ def refine_fine_annotation_with_broad_conditioning(
 
 
 
-def annotate_immune_with_celltypist(
-    adata: anndata.AnnData,
-    model: str = "Immune_All_High.pkl",
-    majority_voting: bool = True,
-):
-    import celltypist
-    from celltypist import models
-    models.download_models(model=model)
-    source = adata.raw.to_adata() if adata.raw is not None else adata.copy()
-    prediction = celltypist.annotate(source, model=model, majority_voting=majority_voting)
-    obs = prediction.predicted_labels.copy()
-    obs.columns = [f"immune_{c}" for c in obs.columns]
-    for c in obs:
-        adata.obs[c] = obs[c].reindex(adata.obs_names)
-    return prediction
-
-
 def export_consensus_annotation(
     output_dir: str | Path,
     result: ConsensusAnnotationResult,
@@ -2027,5 +1935,5 @@ __all__ = [
     "diagnose_census_gene_overlap", "project_query_scvi", "build_reference_cache",
     "annotate_from_census_consensus", "make_cluster_review",
     "refine_fine_annotation_with_broad_conditioning",
-    "annotate_immune_with_celltypist", "export_consensus_annotation",
+    "export_consensus_annotation",
 ]

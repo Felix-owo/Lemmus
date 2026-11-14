@@ -24,6 +24,7 @@ from .io import (
     atomic_write_h5ad,
     atomic_write_json,
     sanitize_for_h5ad,
+    human_annotation_reference_identity,
 )
 from .qc import (
     _qc_snapshot_id,
@@ -36,6 +37,7 @@ from .qc import (
     publish_rna_qc_table,
 )
 from ..paths import PIPELINE_ROOT
+from ..io import sha256_file, file_stat_identity
 
 
 def sample_tissue_from_library(library: str) -> str:
@@ -84,6 +86,9 @@ def publish_full_annotated(adata_full, adata_analyzed, mask):
         if column not in published.var.columns:
             published.var[column] = adata_analyzed.var[column]
     published.uns.update(adata_analyzed.uns)
+    # X is original counts; subset-only graphs are not exported onto the full cell axis.
+    published.uns.pop('log1p', None)
+    published.uns.pop('neighbors', None)
     return published
 
 
@@ -91,6 +96,7 @@ def normalize_log_hvg(adata, params: dict) -> None:
     """Full-gene invariant: no gene subsetting before projection; HVGs only
     mask the PCA computed later."""
     import scanpy as sc
+    import numpy as np
 
     if "counts" not in adata.layers:
         raise AnalysisError("Missing raw counts layer before normalization.")
@@ -105,6 +111,10 @@ def normalize_log_hvg(adata, params: dict) -> None:
     gene_symbols = adata.var["gene_symbol"].astype(str).str.upper()
     adata.var["is_ig"] = gene_symbols.str.match(r"^IG[HKL]")
     adata.var["is_mt"] = gene_symbols.str.startswith("MT-")
+    support = params["gene_support_min_expected_umi"]
+    adata.var["n_cells_supported"] = np.asarray(
+        (adata.layers["counts"] >= support).sum(axis=0)
+    ).ravel().astype(np.int64)
     pca_mask = adata.var["highly_variable"].copy()
     pca_mask &= adata.var["n_cells_supported"].ge(params["min_cells_per_gene"])
     if params["exclude_ig_from_pca"]:
@@ -160,7 +170,7 @@ def annotate_mouse(adata, markers_top30):
 
     from . import annotation_mouse as mouse_anno
 
-    if getattr(mouse_anno, "MODULE_VERSION", None) != "v1":
+    if getattr(mouse_anno, "MODULE_VERSION", None) != "v2":
         raise AnalysisError(
             f"Wrong lemmus.downstream.annotation_mouse module loaded: {getattr(mouse_anno, 'MODULE_VERSION', None)!r}"
         )
@@ -197,7 +207,6 @@ def annotate_human(adata, markers_top30, census_params: dict, pipeline_root: Pat
         adata,
         model_dir=model_dir,
         reference_cache=model_dir / f"census_{census_params['census_version']}_scvi_reference.npz",
-        ontology_path=pipeline_root / "resources" / "hg38_reference" / "cell_ontology" / "cl-basic.obo",
         cluster_key="leiden",
         census_version=census_params["census_version"],
         candidate_cells=census_params["candidate_cells"],
@@ -263,8 +272,6 @@ def run_analysis(
     *,
     params: dict | None = None,
     dna_project_root: Path | None = None,
-    enable_immune_optional: bool = False,
-    output_root: Path | None = None,
 ) -> Path:
     """从原始RNA计数计算QC、聚类和注释；固定路径覆盖，完成摘要最后提交。"""
     import importlib.metadata
@@ -279,13 +286,15 @@ def run_analysis(
     pipeline_root = PIPELINE_ROOT
     params = validate_analysis_params(params)
 
+    snapshot_id = _qc_snapshot_id(project_dir)
     species = detect_species(project_dir)
+    reference_identity, reference_states = ({}, {}) if species == 'mouse' else human_annotation_reference_identity(
+        pipeline_root, DEFAULT_CENSUS_PARAMS['census_version'])
     print(f"INFO: RNA 分析开始；物种：{species}；项目：{project_dir}", flush=True)
 
     # MT比例从原始生物gene计数计算；先校验所有输入，再替换正式QC。
     full, inputs = build_rna_qc_table(project_dir)
-    snapshot_id = _qc_snapshot_id(project_dir)
-    out_dir = (output_root or project_dir / "06_downstream").expanduser()
+    out_dir = project_dir / "06_downstream"
     if out_dir.is_symlink():
         raise AnalysisError(f"QC output directory must not be a symlink: {out_dir}")
     out_dir = out_dir.resolve()
@@ -293,17 +302,17 @@ def run_analysis(
     with write_lock(out_dir):
         adata = load_rna_matrix(project_dir)
         compute_rna_qc(adata, params)
-        _mt = adata.obs["pct_counts_mt"].reindex(full["Sample_ID"].astype(str))
-        if bool(_mt.isna().any()):
-            missing = _mt[_mt.isna()].index.tolist()[:10]
+        cell_ids = full["Sample_ID"].astype(str)
+        missing = cell_ids.loc[~cell_ids.isin(adata.obs_names)].tolist()[:10]
+        if missing:
             raise AnalysisError(
                 "RNA QC table cells absent from the expression matrix; cannot "
                 "attach pct_counts_mt: " + ", ".join(missing)
             )
-        full["pct_counts_mt"] = _mt.to_numpy()
+        full["pct_counts_mt"] = adata.obs["pct_counts_mt"].reindex(cell_ids).to_numpy()
         integrated = None
         if dna_project_root is not None:
-            dna_qc, dna_manifest = load_dna_qc(Path(dna_project_root))
+            dna_qc, dna_manifest = load_dna_qc(Path(dna_project_root), expected_reference=inputs['rna_reference'])
             integrated = integrate_dna_qc(
                 publish_rna_qc_table(full), dna_qc, dna_manifest, rna_identity=full
             )
@@ -314,7 +323,7 @@ def run_analysis(
                              "library_map": integrated.attrs.get("library_map", {})}
         clear_analysis_outputs(out_dir, input_id=snapshot_id)
         atomic_write_csv(publish_rna_qc_table(full), out_dir / "RNA_QC_Information.csv")
-        manifest_src = project_dir / "00_config" / "sample_manifest.tsv"
+        manifest_src = Path(inputs['sample_manifest'])
         atomic_write_bytes(manifest_src.read_bytes(), out_dir / "sample_manifest.tsv")
 
         # 聚类只消费通过QC的子集；正式H5AD仍保留全部细胞和原始计数。
@@ -330,7 +339,8 @@ def run_analysis(
         normalize_log_hvg(adata, params)
         cluster_and_embed(adata, params)
         markers_top30 = compute_cluster_markers(adata)
-        atomic_write_csv(markers_top30, out_dir / "RNA_Leiden_top30_markers.csv")
+        markers_path = out_dir / "RNA_Leiden_top30_markers.csv"
+        atomic_write_csv(markers_top30, markers_path)
 
         expression_support_audit = _expression_support_audit(adata)
         atomic_write_csv(expression_support_audit, out_dir / "RNA_expression_support_audit.csv", index=True)
@@ -344,19 +354,22 @@ def run_analysis(
         print(f"INFO: 细胞注释开始；物种分支：{species}", flush=True)
         if species == "mouse":
             mouse_result = annotate_mouse(adata, markers_top30)
-            atomic_write_csv(mouse_result.cluster_review, out_dir / "RNA_mouse_cluster_marker_review.csv", index=True)
+            review_path = out_dir / "RNA_mouse_cluster_marker_review.csv"
+            atomic_write_csv(mouse_result.cluster_review, review_path, index=True)
             broad_by_library = pd.crosstab(adata.obs["cell_type_final"], adata.obs["library"])
             detail_by_library = pd.crosstab(adata.obs["cell_type_detail_final"], adata.obs["library"])
             detail_level_by_library = pd.crosstab(adata.obs["cell_type_detail_level"], adata.obs["library"])
             annotated_h5ad = out_dir / "RNA_mouse_marker_annotated.h5ad"
             annotation_summary = {
-                "method": f"mouse_marker_program_v1",
+                "method": "mouse_marker_program_v2",
                 "module_version": mouse_anno_version(),
             }
         else:
             census_params = {**DEFAULT_CENSUS_PARAMS}
             census_result, cluster_review = annotate_human(adata, markers_top30, census_params, pipeline_root)
-            atomic_write_csv(cluster_review, out_dir / "RNA_cluster_annotation_review.csv", index=True)
+            adata.uns['human_annotation_reference'] = reference_identity
+            review_path = out_dir / "RNA_cluster_annotation_review.csv"
+            atomic_write_csv(cluster_review, review_path, index=True)
             broad_by_library = pd.crosstab(adata.obs["cell_type_final"], adata.obs["library"])
             detail_by_library = pd.crosstab(adata.obs["cell_type_detail_final"], adata.obs["library"])
             detail_level_by_library = pd.crosstab(adata.obs["cell_type_detail_level"], adata.obs["library"])
@@ -365,10 +378,9 @@ def run_analysis(
             atomic_write_csv(fine_rejection_by_library, out_dir / "RNA_fine_label_rejection_by_library.csv", index=True)
             atomic_write_csv(reference_label_qc, out_dir / "RNA_conditioned_reference_label_qc.csv", index=True)
             atomic_write_csv(census_result.reference_tissue_summary, out_dir / "RNA_census_reference_tissue_summary.csv", index=True)
-            if enable_immune_optional:
-                _annotate_immune_optional(adata)
             annotated_h5ad = out_dir / "RNA_Census_consensus_annotated.h5ad"
-            annotation_summary = {"method": "census_scvi_consensus", "census_version": census_params["census_version"]}
+            annotation_summary = {"method": "census_scvi_consensus", "census_version": census_params["census_version"],
+                                  "reference": reference_identity}
 
         print(f"INFO: 细胞注释完成；耗时：{perf_counter() - stage_started:.2f}s", flush=True)
         # 未通过QC的细胞保持空注释，不把缺失解释为阴性。
@@ -379,15 +391,20 @@ def run_analysis(
             out_dir / "RNA_QC_Information.csv",
         )
 
-        atomic_write_csv(cluster_by_library, out_dir / "RNA_cluster_by_library.csv", index=True)
-        atomic_write_csv(broad_by_library, out_dir / "RNA_broad_annotation_by_library.csv", index=True)
+        notebook_reports = {
+            out_dir / "RNA_cluster_by_library.csv": cluster_by_library,
+            out_dir / "RNA_broad_annotation_by_library.csv": broad_by_library,
+        }
+        for report_path, frame in notebook_reports.items():
+            atomic_write_csv(frame, report_path, index=True)
         atomic_write_csv(detail_by_library, out_dir / "RNA_detail_annotation_by_library.csv", index=True)
         atomic_write_csv(detail_level_by_library, out_dir / "RNA_detail_level_by_library.csv", index=True)
         sample_tissue_summary = (
             adata.obs.groupby(["sample_tissue", "library"], observed=True)
             .size().rename("n_cells").reset_index().sort_values(["sample_tissue", "library"])
         )
-        atomic_write_csv(sample_tissue_summary, out_dir / "RNA_sample_tissue_summary.csv")
+        tissue_summary_path = out_dir / "RNA_sample_tissue_summary.csv"
+        atomic_write_csv(sample_tissue_summary, tissue_summary_path)
 
         # Complete-cell publication: raw counts and qc_pass for every cell;
         # analysis results (leiden/annotations/embeddings) only for qc_pass cells.
@@ -419,29 +436,38 @@ def run_analysis(
                 versions[package] = importlib.metadata.version(package)
             except importlib.metadata.PackageNotFoundError:
                 versions[package] = None
+        qc_artifacts = [out_dir / "RNA_QC_Information.csv", out_dir / "RNA_cell_qc_metrics.csv",
+                        annotated_h5ad, markers_path, review_path, *notebook_reports, tissue_summary_path]
+        if integrated_path is not None:
+            qc_artifacts.append(integrated_path)
+        summary = {
+            "analysis_stage_version": ANALYSIS_STAGE_VERSION,
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "qc_snapshot_id": snapshot_id,
+            "project_dir": str(project_dir),
+            "species": species,
+            "params": params,
+            "random_state": params["random_state"],
+            "annotation": annotation_summary,
+            "package_versions": versions,
+            "n_cells": int(adata.n_obs),
+            "n_cells_total": int(published.n_obs),
+            "n_genes": int(adata.n_vars),
+            "n_leiden_clusters": int(adata.obs["leiden"].nunique()),
+            "annotated_h5ad": annotated_h5ad.name,
+            "integrated_table": integrated_path.name if integrated_path else None,
+            "qc_artifacts": {path.name: sha256_file(path) for path in qc_artifacts},
+            "inputs": inputs,
+        }
         if _qc_snapshot_id(project_dir) != snapshot_id:
             raise AnalysisError('RNA输入在分析期间改变；本次输出未完成，请重试')
-        atomic_write_json(
-            {
-                "analysis_stage_version": ANALYSIS_STAGE_VERSION,
-                "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-                "qc_snapshot_id": snapshot_id,
-                "project_dir": str(project_dir),
-                "species": species,
-                "params": params,
-                "random_state": params["random_state"],
-                "annotation": annotation_summary,
-                "package_versions": versions,
-                "n_cells": int(adata.n_obs),
-                "n_cells_total": int(published.n_obs),
-                "n_genes": int(adata.n_vars),
-                "n_leiden_clusters": int(adata.obs["leiden"].nunique()),
-                "annotated_h5ad": annotated_h5ad.name,
-                "integrated_table": integrated_path.name if integrated_path else None,
-                "inputs": inputs,
-            },
-            out_dir / "analysis_summary.json",
-        )
+        if dna_project_root is not None:
+            current, _ = load_dna_qc(Path(dna_project_root), expected_reference=inputs['rna_reference'])
+            if current.attrs['dna_provenance'] != dna_qc.attrs['dna_provenance']:
+                raise AnalysisError('DNA输入在分析期间改变；本次整合未完成，请重试')
+        if any(file_stat_identity(path) != state for path, state in reference_states.items()):
+            raise AnalysisError('Human annotation reference changed during analysis; outputs are incomplete, retry')
+        atomic_write_json(summary, out_dir / "analysis_summary.json")
         print(f"INFO: RNA 分析完成；QC 通过：{adata.n_obs}/{published.n_obs} 个细胞；总耗时：{perf_counter() - started:.2f}s；输出：{out_dir}", flush=True)
         return out_dir
 
@@ -450,12 +476,3 @@ def mouse_anno_version() -> str:
     from . import annotation_mouse as mouse_anno
 
     return str(getattr(mouse_anno, "MODULE_VERSION", "unknown"))
-
-
-def _annotate_immune_optional(adata) -> None:
-    """Optional CellTypist immune refinement (human-trained models only)."""
-    from . import annotation_human as cta
-
-    cta.annotate_immune_with_celltypist(
-        adata, model="Immune_All_High.pkl", majority_voting=True, download_model=True, prefix="immune_",
-    )

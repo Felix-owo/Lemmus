@@ -1,11 +1,13 @@
 """Lemmus：RNA calling、原生计数与项目细胞身份。"""
 from __future__ import annotations
-from .io import project_temporary_parent, atomic_output
+from .io import project_temporary_parent, atomic_output, validate_file_outputs, file_stat_identity, stable_file_identity, sha256_file, read_delimited_frame
 
 import argparse
+import csv
 import hashlib
 import json
 import os
+import struct
 import subprocess
 import tempfile
 import time
@@ -22,6 +24,7 @@ from .config import (
     PROTOCOLS,
     RNA_RESOLUTION,
     RNA_GENE_EC_ORDER,
+    RNA_CALLING_CONTRACT,
     RRNA_COMPETITOR_ID,
     RRNA_REFERENCES,
     SAMPLE_ID_PATTERN,
@@ -64,23 +67,76 @@ jsonlite::write_json(list(method="DropletUtils::emptyDrops", version="1.30.0",
 '''
 
 
+def validate_prepared_rna(adata):
+    """核对prepared PG来源与表达轴；backed读取只检查元数据，不加载X。"""
+    if RRNA_COMPETITOR_ID in adata.var_names:
+        raise ValueError('Use prepare-rna-counts to separate the 45S technical feature before finalization or before cell calling')
+    if not adata.obs_names.is_unique or not adata.var_names.is_unique:
+        raise ValueError('Prepared RNA cell/gene identities must be unique')
+    policy = adata.uns.get('rna_quantification', {})
+    excluded = policy.get('technical_feature_excluded_from_expression') if isinstance(policy, dict) else None
+    if (not isinstance(policy, dict) or policy.get('resolution') != RNA_RESOLUTION
+            or policy.get('gene_level_ec_order') != RNA_GENE_EC_ORDER
+            or not isinstance(excluded, (bool, np.bool_)) or not excluded):
+        raise ValueError('RNA stage requires prepared native parsimony-gene counts; rerun prepare-rna-counts')
+
+
+def validate_rna_count_matrix(matrix):
+    """Validate H5AD count storage before converting or slicing the matrix."""
+    from scipy import sparse
+
+    if sparse.issparse(matrix):
+        if matrix.format not in {'csr', 'csc'}:
+            raise ValueError('Native RNA counts require CSR or CSC sparse storage')
+        rows, columns = matrix.shape
+        major, minor = (rows, columns) if matrix.format == 'csr' else (columns, rows)
+        pointers, indices, values = matrix.indptr, matrix.indices, matrix.data
+        if (pointers.ndim != 1 or indices.ndim != 1 or values.ndim != 1
+                or pointers.dtype.kind != 'i' or indices.dtype.kind != 'i'
+                or pointers.size != major + 1 or pointers[0] != 0
+                or pointers[-1] != indices.size or indices.size != values.size
+                or (pointers[1:] < pointers[:-1]).any()
+                or (indices.size and (indices.min() < 0 or indices.max() >= minor))):
+            raise ValueError('Native RNA counts have invalid sparse coordinate storage')
+        # Inspect current buffers without inheriting possibly stale format flags.
+        storage_type = sparse.csr_array if matrix.format == 'csr' else sparse.csc_array
+        storage = storage_type((values, indices, pointers), shape=matrix.shape, copy=False)
+        if not storage.has_canonical_format and not storage.sorted_indices().has_canonical_format:
+            raise ValueError('Native RNA counts contain duplicate sparse coordinates')
+    else:
+        values = np.asarray(matrix)
+    if (values.dtype.kind not in 'iuf' or not np.isfinite(values).all()
+            or (values < 0).any() or (values != np.floor(values)).any()):
+        raise ValueError('Native RNA molecule counts must be finite nonnegative integers; never round')
+
+
+def _prepared_count_matrix(adata):
+    """calling/finalize消费同一PG生物矩阵；未调用细胞也不能隐藏非法分子计数。"""
+    import scipy.sparse as sp
+    validate_prepared_rna(adata)
+    validate_rna_count_matrix(adata.X)
+    # Older SciPy can reduce float32 values before applying sum(dtype=...).
+    dtype = np.float64 if adata.X.dtype.kind == 'f' and adata.X.dtype.itemsize < 8 else None
+    matrix = sp.csr_matrix(adata.X, dtype=dtype, copy=True)
+    matrix.eliminate_zeros()  # 仅统计副本去除显式零，不将存储项数量当检出基因数。
+    return matrix
+
+
 def call_droplet_rna(input_h5ad: Path, calls: Path, qc: Path, rscript: Path) -> None:
-    """仅对临时稀疏矩阵运行标准取整空液滴检验；原始 EM 表达矩阵保持只读。"""
+    """以原生整数背景运行emptyDrops，输入矩阵与调用表共同绑定到最后提交的QC。"""
     import anndata as ad
     import hdf5plugin
     import scipy.sparse as sp
     from scipy.io import mmwrite
+    validate_file_outputs((input_h5ad, rscript), (calls, qc, qc.with_suffix('.failed.json')))
     for path in (calls, qc):
         path.parent.mkdir(parents=True, exist_ok=True)
+    source_identity = stable_file_identity(input_h5ad)
     adata = ad.read_h5ad(input_h5ad)
-    if RRNA_COMPETITOR_ID in adata.var_names:
-        raise ValueError('Use prepare-rna-counts to separate the 45S technical feature before cell calling')
-    if not adata.obs_names.is_unique:
-        raise ValueError('Duplicate RNA barcode in raw quantification')
+    matrix = sp.csc_matrix(_prepared_count_matrix(adata).T)
     whitelist = load_droplet_whitelist(droplet_whitelist_path())
     if set(map(str, adata.obs_names)) - whitelist:
         raise ValueError('Raw RNA quantification contains a barcode outside the design whitelist')
-    matrix = sp.csc_matrix(adata.X.T)
     if matrix.data.size == 0 or not np.isfinite(matrix.data).all() or (matrix.data < 0).any():
         raise ValueError('emptyDrops requires a finite nonnegative, nonempty background matrix')
     started = time.monotonic()
@@ -100,7 +156,12 @@ def call_droplet_rna(input_h5ad: Path, calls: Path, qc: Path, rscript: Path) -> 
             payload['elapsed_seconds'] = time.monotonic()-started
             payload['expected_count_sum'] = float(matrix.sum())
             payload['status'] = 'PASS' if payload['called_cells'] else 'NO_CALLED_CELLS'
+            payload['input_contract'] = RNA_CALLING_CONTRACT
+            payload['input_counts_sha256'] = source_identity[0]
+            payload['calls_sha256'] = sha256_file(folder/'calls.tsv')
             (folder/'qc.json').write_text(json.dumps(payload, indent=2)+'\n')
+            if stable_file_identity(input_h5ad) != source_identity:
+                raise ValueError('RNA input changed during cell calling')
             qc.unlink(missing_ok=True)
             os.replace(folder/'calls.tsv', calls)
             os.replace(folder/'qc.json', qc)
@@ -211,28 +272,122 @@ def prepare_rrna_reference(species: str, output: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def piscem_index_files(index: Path) -> tuple[Path, ...]:
+    common = tuple(index / f'piscem_idx.{suffix}' for suffix in ('ctab', 'ectab', 'refinfo'))
+    tiny = (index / 'piscem_idx.tdct', index / 'piscem_idx.tct')
+    # Piscem 0.22 selects Tiny when both paths exist, otherwise it loads SSHash.
+    dictionary = tiny if all(path.exists() for path in tiny) else (
+        index / 'piscem_idx.ssi', index / 'piscem_idx.ssi.mphf',
+    )
+    return (*common, *dictionary)
+
+
+def _validate_piscem_transcript_coverage(refinfo: Path, remaining_transcripts: set[str]) -> None:
+    # Piscem 0.22.1 writes the RAD target names from its PRFINF01 reference table.
+    data = refinfo.read_bytes()
+    invalid = f'Invalid Piscem reference table: {refinfo}'
+    if len(data) < 16 or not data.startswith(b'PRFINF01'):
+        raise ValueError(invalid)
+    count, = struct.unpack_from('<Q', data, 8)
+    names_end = len(data) - 8 * count  # The last array holds the sequence lengths.
+    offset = 16
+    for _ in range(count):
+        if offset + 4 > names_end:
+            raise ValueError(invalid)
+        size, = struct.unpack_from('<I', data, offset)
+        offset += 4
+        end = offset + size
+        if not size or end > names_end:
+            raise ValueError(invalid)
+        try:
+            transcript = data[offset:end].decode('utf-8')
+        except UnicodeDecodeError as error:
+            raise ValueError(invalid) from error
+        if transcript not in remaining_transcripts:
+            raise ValueError(f'Piscem transcript {transcript!r} has no unique matching row in t2g.tsv: {refinfo}')
+        remaining_transcripts.remove(transcript)
+        offset = end
+    if offset != names_end:
+        raise ValueError(invalid)
+    if RRNA_COMPETITOR_ID in remaining_transcripts:
+        raise ValueError(f'PG+45S requires the 45S competitor in the Piscem index: {refinfo}')
+
+
+def _read_rna_gene_names(path: Path, expected_genes: set[str]) -> dict[str, str]:
+    names: dict[str, str] = {}
+    with path.open(encoding='utf-8-sig', newline='') as handle:
+        rows = csv.reader(handle, delimiter='\t', strict=True)
+        try:
+            for fields in rows:
+                if len(fields) != 2 or not all(fields):
+                    raise ValueError(f'Reference gene map requires two nonempty fields at {path}:{rows.line_num}')
+                gene, symbol = fields
+                if gene in names:
+                    raise ValueError(f'Reference gene map has duplicate gene {gene!r} at {path}:{rows.line_num}')
+                names[gene] = symbol
+        except csv.Error as error:
+            raise ValueError(f'Invalid reference gene map at {path}:{rows.line_num}: {error}') from error
+    if names.keys() != expected_genes:
+        missing = min(expected_genes - names.keys(), default=None)
+        extra = min(names.keys() - expected_genes, default=None)
+        raise ValueError(f'Reference gene map does not match the quantification genes in {path} '
+                         f'(example missing: {missing!r}; example extra: {extra!r})')
+    return names
+
+
 def _validate_rrna_reference_files(reference: Path, species: str) -> dict[str, str]:
     spec = rrna_reference_spec(species)
     required = ['genome.fa', 'genes/genes.gtf', 'rrna_competitor.fa', 'simpleaf/ref/t2g.tsv',
-                'simpleaf/index/piscem_idx.ctab', 'simpleaf/index/piscem_idx.ectab',
-                'simpleaf/index/piscem_idx.refinfo', 'simpleaf/index/gene_id_to_name.tsv']
+                'simpleaf/index/gene_id_to_name.tsv']
     missing = [name for name in required if not (reference/name).is_file() or not (reference/name).stat().st_size]
     if missing:
         raise ValueError('PG+45S RNA reference incomplete: '+', '.join(missing))
+    index = reference / 'simpleaf/index'
+    metadata_path = index / 'simpleaf_index.json'
+    if not metadata_path.is_file():
+        raise ValueError(f'PG+45S RNA reference requires {metadata_path}')
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+    except (ValueError, OSError) as error:
+        raise ValueError(f'Cannot read Simpleaf index metadata {metadata_path}: {error}') from error
+    if not isinstance(metadata, dict) or metadata.get('index_type') != 'piscem':
+        raise ValueError(f'{metadata_path} must describe a Piscem index')
+    t2g_file = metadata.get('t2g_file')
+    if t2g_file is not None and not isinstance(t2g_file, str):
+        raise ValueError(f'{metadata_path} must use a string or null for t2g_file')
+    missing = [path.name for path in piscem_index_files(index)
+               if not path.is_file() or not path.stat().st_size]
+    if missing:
+        raise ValueError('PG+45S Piscem dictionary incomplete: ' + ', '.join(missing))
     if hashlib.sha256((reference/'rrna_competitor.fa').read_bytes()).hexdigest() != spec['fasta_sha256']:
         raise ValueError('RNA reference 45S competitor differs from the pinned species sequence')
     found = 0
-    with (reference/'simpleaf/ref/t2g.tsv').open() as handle:
-        for line in handle:
+    seen_transcripts = set()
+    genes = set()
+    mapping = reference / 'simpleaf/ref/t2g.tsv'
+    with mapping.open(encoding='utf-8-sig') as handle:
+        for line_number, line in enumerate(handle, 1):
             fields = line.rstrip('\n').split('\t')
             if len(fields) != 2 or not all(fields):
                 raise ValueError('PG+45S requires a nonempty two-column transcript-to-gene map')
+            transcript, gene = fields
+            # alevin-fry interprets leading quotes as TSV quoting, which can change an ID.
+            if transcript.startswith('"') or gene.startswith('"'):
+                raise ValueError(f'PG+45S requires unquoted transcript and gene IDs at {mapping}:{line_number}')
             if RRNA_COMPETITOR_ID in fields:
                 if fields != [RRNA_COMPETITOR_ID, RRNA_COMPETITOR_ID]:
                     raise ValueError('45S technical transcript/gene identity conflict')
                 found += 1
+            elif transcript in seen_transcripts:
+                raise ValueError(f'PG+45S duplicate transcript {transcript!r} at {mapping}:{line_number}')
+            else:
+                seen_transcripts.add(transcript)
+            genes.add(gene)
     if found != 1:
         raise ValueError('RNA reference must contain exactly one explicit 45S competitor mapping')
+    seen_transcripts.add(RRNA_COMPETITOR_ID)
+    _validate_piscem_transcript_coverage(index / 'piscem_idx.refinfo', seen_transcripts)
+    _read_rna_gene_names(index / 'gene_id_to_name.tsv', genes)
     return spec
 
 
@@ -282,6 +437,12 @@ def export_rna_counts(quant_dir: Path, gene_map: Path, output_h5ad: Path) -> Non
     import anndata as ad
     import scipy.sparse as sp
 
+    inputs = [gene_map, *(quant_dir / name for name in (
+        'quant.json', 'featureDump.txt', 'generate_permit_list.json', 'collate.json',
+        'simpleaf_map_info.json', 'alevin/quants_mat.mtx',
+        'alevin/quants_mat_rows.txt', 'alevin/quants_mat_cols.txt'))]
+    validate_file_outputs(inputs, [output_h5ad])
+    input_identities = {path: file_stat_identity(path) for path in inputs}
     quant = json.loads((quant_dir / 'quant.json').read_text())
     if quant.get('resolution_strategy') != 'ParsimonyGene' or quant.get('usa_mode') is not False or quant.get('gene_level_ec_order') != RNA_GENE_EC_ORDER:
         raise ValueError('RNA export requires two-column parsimony-gene quantification with canonical gene-equivalence identities')
@@ -295,13 +456,9 @@ def export_rna_counts(quant_dir: Path, gene_map: Path, output_h5ad: Path) -> Non
 
     barcodes = axis('quants_mat_rows.txt')
     genes = axis('quants_mat_cols.txt')
-    names = pd.read_csv(gene_map, sep='\t', header=None, dtype=str, keep_default_na=False)
-    if (names.shape[1] != 2 or (names == '').any().any() or names[0].duplicated().any()
-            or set(names[0]) != set(genes)):
-        raise ValueError('Reference gene map must match every native gene exactly once')
-    names.columns = ['gene_id', 'gene_symbol']
-    var = names.set_index('gene_id', drop=False).loc[genes].copy()
-    var.index.name = 'index'
+    names = _read_rna_gene_names(gene_map, set(genes))
+    var = pd.DataFrame({'gene_id': genes, 'gene_symbol': [names[gene] for gene in genes]},
+                       index=pd.Index(genes, name='index'))
 
     with (folder / 'quants_mat.mtx').open() as handle:
         header = handle.readline().strip().lower().split()
@@ -317,7 +474,7 @@ def export_rna_counts(quant_dir: Path, gene_map: Path, output_h5ad: Path) -> Non
             raise ValueError('Native quantification metadata, axes and matrix shape disagree')
         dtype = [('row', np.int64), ('col', np.int64),
                  ('value', np.int64 if header[3] == 'integer' else np.float64)]
-        entries = np.loadtxt(handle, dtype=dtype, ndmin=1) if nnz else np.empty(0, dtype=dtype)
+        entries = np.loadtxt(handle, dtype=dtype, comments=None, ndmin=1) if nnz else np.empty(0, dtype=dtype)
         if nnz == 0 and any(line.strip() and not line.startswith('%') for line in handle):
             raise ValueError('Native matrix has undeclared entries')
     if (len(entries) != nnz or (entries['row'] < 1).any() or (entries['row'] > rows).any()
@@ -333,22 +490,40 @@ def export_rna_counts(quant_dir: Path, gene_map: Path, output_h5ad: Path) -> Non
                   DeduplicatedReads='deduplicated_reads', MappingRate='mapping_rate',
                   DedupRate='dedup_rate', MeanByMax='mean_by_max',
                   NumGenesExpressed='num_genes_expressed', NumGenesOverMean='num_genes_over_mean')
-    feature_types = {key: (np.int64 if key in {'CorrectedReads', 'MappedReads',
-                     'NumGenesExpressed', 'NumGenesOverMean'} else np.float64) for key in rename}
-    features = pd.read_csv(quant_dir / 'featureDump.txt', sep='\t',
-                           dtype=str, keep_default_na=False)
+    integer_features = {'CorrectedReads', 'MappedReads', 'NumGenesExpressed', 'NumGenesOverMean'}
+    ratio_features = {'MappingRate', 'DedupRate', 'MeanByMax'}
+    feature_path = quant_dir / 'featureDump.txt'
+    features = read_delimited_frame(feature_path, sep='\t')
     if list(features.columns) != ['CB', *rename] or features['CB'].tolist() != barcodes:
         raise ValueError('Native featureDump barcode identity/order or columns disagree')
-    obs = features.drop(columns='CB').rename(columns=rename)
-    for column in obs:
-        # 原生空背景条码的比率可为 NaN；保留未定义值，不补零、不改分子计数。
-        source_name = next(key for key, value in rename.items() if value == column)
-        obs[column] = np.asarray(obs[column], dtype=feature_types[source_name])
-    obs.index = pd.Index(barcodes, name='index')
+    obs = pd.DataFrame(index=pd.Index(barcodes, name='index'))
+    for source_name, column in rename.items():
+        dtype = np.int64 if source_name in integer_features else np.float64
+        try:
+            values = np.asarray(features[source_name], dtype=dtype)
+        except (ValueError, OverflowError) as error:
+            raise ValueError(f'Invalid {source_name} values in {feature_path}') from error
+        # An undefined native ratio may be NaN. Native counts must be finite.
+        invalid = np.isinf(values) if source_name in ratio_features else ~np.isfinite(values)
+        if invalid.any() or (values < 0).any():
+            raise ValueError(f'Invalid {source_name} values in {feature_path}')
+        obs[column] = values
+    # Compare before 45S projection; stored zeros are not expressed genes.
+    gene_support = np.fromiter(
+        (np.count_nonzero(matrix.data[start:end])
+         for start, end in zip(matrix.indptr[:-1], matrix.indptr[1:])),
+        dtype=np.int64, count=matrix.shape[0],
+    )
+    invalid_qc = ((obs['mapped_reads'] > obs['corrected_reads'])
+                  | (obs['num_genes_over_mean'] > obs['num_genes_expressed'])
+                  | (obs['num_genes_expressed'].to_numpy() != gene_support))
+    if invalid_qc.any():
+        raise ValueError(f'Native featureDump QC count relations disagree at {invalid_qc.idxmax()!r}: {feature_path}')
     obs.insert(0, 'barcodes', barcodes)
     uns = {key: json.dumps(json.loads((quant_dir / file).read_text()), separators=(',', ':'))
            for key, file in [('gpl_info', 'generate_permit_list.json'), ('collate_info', 'collate.json'),
-                             ('quant_info', 'quant.json'), ('simpleaf_map_info', 'simpleaf_map_info.json')]}
+                             ('simpleaf_map_info', 'simpleaf_map_info.json')]}
+    uns['quant_info'] = json.dumps(quant, separators=(',', ':'))
     data = ad.AnnData(matrix, obs=obs, var=var, uns=uns)
     output_h5ad.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix='.' + output_h5ad.name + '.', suffix='.h5ad', dir=project_temporary_parent(output_h5ad))
@@ -356,6 +531,9 @@ def export_rna_counts(quant_dir: Path, gene_map: Path, output_h5ad: Path) -> Non
     temporary = Path(name)
     try:
         data.write_h5ad(temporary)
+        for path, identity in input_identities.items():
+            if file_stat_identity(path) != identity:
+                raise ValueError(f'RNA export input changed before publication: {path}')
         os.replace(temporary, output_h5ad)
     finally:
         temporary.unlink(missing_ok=True)
@@ -375,31 +553,37 @@ def prepare_rna_counts(input_h5ad: Path, quant_json: Path, reference: Path,
                        species: str, output_h5ad: Path) -> None:
     """保存45S技术计数再投影生物gene；不取整，不更改任何细胞/生物gene计数。"""
     import anndata as ad
-    import hdf5plugin
     import scipy.sparse as sp
+    validate_file_outputs((input_h5ad, quant_json, reference), (output_h5ad,))
+    input_identities = {path: file_stat_identity(path) for path in (input_h5ad, quant_json)}
     policy = validate_rna_reference(reference, species)
     quant = json.loads(quant_json.read_text())
     if quant.get('resolution_strategy') != 'ParsimonyGene' or quant.get('usa_mode') is not False or quant.get('gene_level_ec_order') != RNA_GENE_EC_ORDER:
         raise ValueError('Production RNA counts require two-column parsimony-gene quantification with canonical gene-equivalence identities')
     data = ad.read_h5ad(input_h5ad)
+    try:
+        exported_quant = json.loads(data.uns.get('quant_info', ''))
+    except (TypeError, ValueError) as error:
+        raise ValueError('RNA matrix lacks valid exported quantification metadata; rerun export-rna-counts') from error
+    if exported_quant != quant:
+        raise ValueError('RNA matrix quantification metadata does not match quant.json; rerun export-rna-counts')
     if not data.obs_names.is_unique or not data.var_names.is_unique:
         raise ValueError('RNA count cell/gene identities must be unique')
     if 'gene_id' in data.var and list(map(str, data.var['gene_id'])) != list(map(str, data.var_names)):
         raise ValueError('RNA var index and gene_id disagree')
     if RRNA_COMPETITOR_ID not in data.var_names:
         raise ValueError('Native RNA matrix lacks the explicit 45S competitor')
+    validate_rna_count_matrix(data.X)
     matrix = sp.csr_matrix(data.X)
-    if (not np.isfinite(matrix.data).all() or (matrix.data < 0).any()
-            or (matrix.data != np.floor(matrix.data)).any()):
-        raise ValueError('Native parsimony-gene molecule counts must be finite nonnegative integers; never round')
-    matrix.eliminate_zeros()
     if quant.get('num_genes') != data.n_vars or quant.get('num_quantified_cells') != data.n_obs:
         raise ValueError('Native quantification metadata and matrix shape disagree')
     j = data.var_names.get_loc(RRNA_COMPETITOR_ID)
     sink = np.asarray(matrix[:,j].sum(axis=1)).ravel()
     keep = np.arange(data.n_vars) != j
     biological = data[:,keep].copy()
-    biological.X = matrix[:,keep].copy()
+    # Compact only the owned slice. The input CSR can share its index buffers with matrix.
+    biological.X = sp.csr_matrix(biological.X)
+    biological.X.eliminate_zeros()
     biological.obs['rna45s_competitor_counts'] = sink
     biological.uns['rna_quantification'] = {**policy, 'count_semantics': 'native unrounded non-EM molecule counts',
         'quantifier_version': str(quant.get('version_str', 'not_recorded')),
@@ -411,6 +595,9 @@ def prepare_rna_counts(input_h5ad: Path, quant_json: Path, reference: Path,
     os.close(fd); temporary = Path(name)
     try:
         biological.write_h5ad(temporary)
+        for path, identity in input_identities.items():
+            if file_stat_identity(path) != identity:
+                raise ValueError(f'RNA projection input changed before publication: {path}')
         os.replace(temporary, output_h5ad)
     finally:
         temporary.unlink(missing_ok=True)
@@ -441,7 +628,12 @@ def finalize_rna_h5ad(
     permit_qc: Path | None = None,
     map_info: Path | None = None,
 ) -> Path:
-    """Create the project-level RNA.h5ad from raw simpleaf quantification."""
+    """发布prepared PG生物计数和稳定项目细胞身份，拒绝来源不匹配的旧调用。"""
+    validate_file_outputs(
+        [path for path in (input_h5ad, barcode_map, calls, calling_qc,
+                          preprocess_qc, permit_qc, map_info) if path is not None],
+        [output_h5ad],
+    )
     try:
         import anndata as ad
         import hdf5plugin  # noqa: F401 - registers simpleaf's Blosc HDF5 filter
@@ -452,16 +644,21 @@ def finalize_rna_h5ad(
         ) from exc
 
     source = Path(input_h5ad)
+    if protocol not in PROTOCOLS:
+        raise ValueError(f'Unsupported RNA protocol: {protocol}')
     if not source.is_file():
         raise FileNotFoundError(f"simpleaf quants.h5ad does not exist: {source}")
+    identities = {source: stable_file_identity(source)}
     adata = ad.read_h5ad(source)
-    if RRNA_COMPETITOR_ID in adata.var_names:
-        raise ValueError('Use prepare-rna-counts to separate the 45S technical feature before finalization')
+    matrix = _prepared_count_matrix(adata)
+    for path in (barcode_map, calls, calling_qc, preprocess_qc, permit_qc, map_info):
+        if path is not None:
+            identities[Path(path)] = stable_file_identity(path)
     canonical = [str(value) for value in adata.obs_names]
     if protocol == 'droplet':
         if barcode_map is not None or any(p is None for p in (calls, calling_qc, preprocess_qc, permit_qc, map_info)):
             raise ValueError('Droplet finalization requires independent RNA calls and QC, without Barcode Map')
-        if not SAMPLE_ID_PATTERN.fullmatch(sample_id) or sample_id in {'.', '..'}:
+        if not SAMPLE_ID_PATTERN.fullmatch(sample_id):
             raise ValueError('Invalid Droplet RNA sample ID')
         frame = pd.read_csv(calls, sep='\t', dtype={'barcode': str})
         if frame['barcode'].tolist() != canonical or frame['barcode'].duplicated().any():
@@ -481,12 +678,17 @@ def finalize_rna_h5ad(
                 or not 0 <= sum(barcode_reads) <= mapping['num_mapped'] <= mapping['num_reads']):
             raise ValueError('Droplet trim/mapping/barcode read accounting failed')
         call_metrics = json.loads(calling_qc.read_text())
+        if (call_metrics.get('input_contract') != RNA_CALLING_CONTRACT
+                or call_metrics.get('input_counts_sha256') != identities[source][0]
+                or call_metrics.get('calls_sha256') != identities[Path(calls)][0]):
+            raise ValueError('Droplet calling identity disagrees with the prepared counts/calls; rerun call-droplet-rna')
         if call_metrics.get('status') != 'PASS' or call_metrics['called_cells'] != int(selected.sum()):
             raise ValueError('Droplet calling QC disagrees with the selected cells')
         adata = adata[selected].copy()
+        matrix = matrix[selected].copy()
         frame = frame.loc[selected].copy()
         canonical = list(map(str, adata.obs_names))
-        counts = np.asarray(adata.X.sum(axis=1)).ravel()
+        counts = np.asarray(matrix.sum(axis=1)).ravel()
         rank = {barcode: str(i+1) for i, (_, barcode) in enumerate(sorted(zip(-counts, canonical)))}
         metadata = [dict(cell_id=f'{sample_id}_{barcode}', RNA_Barcode=barcode, PlateID='',
                          Cell_Order=rank[barcode], sample_id=sample_id, rna_sample=rna_sample,
@@ -510,37 +712,18 @@ def finalize_rna_h5ad(
         raise ValueError("RNA.h5ad project cell IDs are not unique")
 
     # 保留原生分子计数和≥1支持度审计；任何消费端都不通过取整制造观测。
-    import scipy.sparse as sp
-
-    matrix = sp.csr_matrix(adata.X)
-    if matrix.data.size and (
-        not np.isfinite(matrix.data).all() or np.any(matrix.data < 0)
-    ):
-        raise ValueError("RNA count matrix contains non-finite or negative values")
     total_expected = np.asarray(matrix.sum(axis=1)).ravel()
     positive_genes = np.diff(matrix.indptr).astype(np.int64)
     supported_genes = np.asarray((matrix >= 1.0).sum(axis=1)).ravel().astype(np.int64)
-    rows = np.repeat(np.arange(matrix.shape[0]), np.diff(matrix.indptr))
-    fractional = ~np.isclose(matrix.data, np.rint(matrix.data), atol=1e-6)
-    subunit = (matrix.data > 0) & (matrix.data < 1.0)
-    fractional_nnz = np.bincount(rows, weights=fractional, minlength=matrix.shape[0])
-    subunit_mass = np.bincount(
-        rows, weights=np.where(subunit, matrix.data, 0.0), minlength=matrix.shape[0]
-    )
+    # Prepared PG counts are validated integers; every positive molecule is supported.
     adata.obs["total_expected_counts"] = total_expected
-    adata.obs["subunit_expected_counts"] = subunit_mass
-    adata.obs["total_supported_expected_counts"] = total_expected - subunit_mass
+    adata.obs["subunit_expected_counts"] = np.zeros_like(total_expected)
+    adata.obs["total_supported_expected_counts"] = total_expected.copy()
     adata.obs["n_genes_positive_expected"] = positive_genes
     adata.obs["n_genes_supported"] = supported_genes
     adata.obs["n_genes_fractional_only"] = positive_genes - supported_genes
-    adata.obs["fractional_nnz_fraction"] = np.divide(
-        fractional_nnz, positive_genes,
-        out=np.zeros(matrix.shape[0], dtype=float), where=positive_genes > 0,
-    )
-    adata.obs["subunit_count_mass_fraction"] = np.divide(
-        subunit_mass, total_expected,
-        out=np.zeros(matrix.shape[0], dtype=float), where=total_expected > 0,
-    )
+    adata.obs["fractional_nnz_fraction"] = 0.0
+    adata.obs["subunit_count_mass_fraction"] = 0.0
 
     provenance = dict(adata.uns.get("rna_darlin_pipeline", {}))
     if protocol == 'droplet':
@@ -577,6 +760,10 @@ def finalize_rna_h5ad(
     destination.parent.mkdir(parents=True, exist_ok=True)
     with atomic_output(destination) as temp_path:
         adata.write_h5ad(temp_path)
+        for path, identity in identities.items():
+            if stable_file_identity(path) != identity:
+                raise ValueError(f'RNA finalization input changed before publication: {path}')
+    return destination
 
 
 def finalize_rna_h5ad_main(argv: Sequence[str] | None = None) -> int:
