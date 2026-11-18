@@ -5,9 +5,11 @@ import hashlib
 import json
 import math
 import os
+import re
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from zipfile import BadZipFile
 import pandas as pd
 from .config import (
     DownstreamQCError,
@@ -224,58 +226,57 @@ def run_droplet_qc_integration(rna_project_root, dna_project_root, *, expected_d
 
 
 def _dna_doublet_input(dna):
-    import h5py
-    import hdf5plugin
-    from anndata.io import read_elem
+    """绑定小型整数计数产物。状态复验无需重复解码矩阵。"""
+    provenance = dna.attrs["dna_provenance"]
+    source = Path(provenance["qc_path"]).parent / "DNA_Doublet_1Mb_Counts.npz"
+    try:
+        state = source.lstat()
+        signature = dict(name=source.name, device=state.st_dev, inode=state.st_ino,
+                         mtime_ns=state.st_mtime_ns, size=state.st_size)
+        if (source.is_symlink() or not source.is_file() or not state.st_size
+                or provenance["doublet_counts"] != signature):
+            raise ValueError("stale integer-count artifact")
+    except (KeyError, OSError, ValueError) as error:
+        raise DownstreamQCError("同代 1 Mb DNA 整数计数缺失或已改变，请重跑 Alopex QC") from error
+    return dict(source=str(source), source_identity=signature, ctime_ns=state.st_ctime_ns,
+                cpg_generation=provenance["cpg_generation"], delivery_id=provenance["delivery_id"],
+                cpg_coordinate_base=provenance["cpg_coordinate_base"])
 
-    provenance = dna.attrs['dna_provenance']
-    source = Path(provenance['qc_path']).parent / 'RawAdata.h5ad'
-    sidecar = source.with_name('RawAdata.input_schema.json')
-    sidecar_bytes = sidecar.read_bytes()
-    payload = json.loads(sidecar_bytes)
-    generation = provenance.get('raw_generation')
-    if not isinstance(generation, str) or not generation or payload.get('generation_id') != generation:
-        raise DownstreamQCError('RawAdata 代际与当前 DNA QC 完成凭证不一致')
-    coordinate_base = payload.get('cpg_coordinate_base')
-    stat = source.stat()
-    signature = dict(device=stat.st_dev, inode=stat.st_ino, mtime_ns=stat.st_mtime_ns,
-                     name=source.name, size=stat.st_size)
-    if (payload.get('schema_version') != 6
-            or type(coordinate_base) is not int or coordinate_base not in (0, 1)
-            or payload.get('cpg_header') != 'chrom\tpos\tmethyl\tunmethyl'
-            or payload.get('delivery_id') != provenance['delivery_id']
-            or payload.get('snapshot_id') != provenance['delivery_id']
-            or payload.get('h5ad') != signature
-            or len(payload.get('sample_ids', [])) != len(dna)
-            or set(payload['sample_ids']) != set(dna.Sample_ID)):
-        raise DownstreamQCError('RawAdata 计数未绑定当前 DNA 交付/细胞集合，请运行同代 DNA downstream')
-    with h5py.File(source, 'r') as handle:
-        ids = read_elem(handle['obs']).index.astype(str)
-        if not ids.is_unique or set(ids) != set(dna.Sample_ID) or '__values__' not in handle['obsm']:
-            raise DownstreamQCError('RawAdata 缺少逐位点 mc/cov 计数或完整 DNA 细胞身份')
-        reference = read_elem(handle['uns/reference_sequences'])
-        if (read_elem(handle['uns/cpg_coordinate_base']) != coordinate_base
-                or 'reference_bp_length' not in reference
-                or not (reference.reference_seq_length == reference.reference_bp_length + coordinate_base).all()):
-            raise DownstreamQCError('RawAdata 坐标与 reference 索引范围不一致')
-    regions = []
-    for name, length in zip(reference.reference_seq_name, reference.reference_bp_length):
-        if str(name).startswith('chr') and str(name)[3:].isdigit() and 1 <= int(str(name)[3:]) <= 22:
-            regions.extend(f'{name}:{start + coordinate_base}-{min(start + 1000000, int(length)) + coordinate_base}'
-                           for start in range(0, int(length), 1000000))
-    if len(regions) < 2:
-        raise DownstreamQCError('RawAdata reference 未提供足够的 chr1–chr22 常染色体区域')
-    after = source.stat()
-    if (any(getattr(stat, key) != getattr(after, key) for key in (
-            'st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns'))
-            or sidecar.read_bytes() != sidecar_bytes):
-        raise DownstreamQCError('RawAdata or its schema changed while reading DNA doublet inputs; retry')
-    identity = dict(source=str(source), source_identity=signature,
-                    sidecar_sha256=hashlib.sha256(sidecar_bytes).hexdigest(),
-                    cpg_coordinate_base=coordinate_base,
-                    generation_id=payload['generation_id'], delivery_id=provenance['delivery_id'],
-                    regions_sha256=hashlib.sha256('\n'.join(regions).encode()).hexdigest(), n_regions=len(regions))
-    return identity, ids, regions
+
+def _load_dna_doublet_counts(dna, identity):
+    import numpy as np
+
+    try:
+        with np.load(identity["source"], allow_pickle=False) as archive:
+            if set(archive.files) != {"ids", "regions", "mc", "cov"}:
+                raise ValueError("invalid integer-count fields")
+            ids = archive["ids"]
+            regions = archive["regions"]
+            mc, cov = archive["mc"], archive["cov"]
+        if (ids.ndim != 1 or ids.dtype.kind != "U" or len(ids) != len(dna)
+                or set(ids) != set(dna.Sample_ID) or regions.ndim != 1 or regions.dtype.kind != "U"
+                or len(regions) < 2 or mc.shape != (len(ids), len(regions)) or mc.shape != cov.shape
+                or mc.dtype != np.int64 or cov.dtype != np.int64 or (mc < 0).any() or (mc > cov).any()):
+            raise ValueError("invalid integer-count shape, type, cell IDs or counts")
+        base = identity["cpg_coordinate_base"]
+        last_chrom, last_end, seen = None, None, set()
+        for label in regions:
+            match = re.fullmatch(r"(chr(?:[1-9]|1[0-9]|2[0-2])):([0-9]+)-([0-9]+)", label)
+            if match is None:
+                raise ValueError("invalid autosomal 1 Mb window name")
+            chrom, start, end = match.groups()
+            start, end = int(start), int(end)
+            if (not 0 < end-start <= 1_000_000
+                    or (chrom == last_chrom and (start != last_end or (start-base)%1_000_000 != 0))
+                    or (chrom != last_chrom and (start != base or chrom in seen))):
+                raise ValueError("invalid autosomal 1 Mb window coordinates")
+            seen.add(chrom)
+            last_chrom, last_end = chrom, end
+    except (BadZipFile, EOFError, KeyError, ValueError, OSError) as error:
+        raise DownstreamQCError("同代 DNA 1 Mb 计数无法读取或内容非法，请重跑 Alopex QC") from error
+    if _dna_doublet_input(dna) != identity:
+        raise DownstreamQCError("DNA 1 Mb 计数在读取期间改变，请重试")
+    return mc, cov, ids
 
 
 def score_dna_doublets(mc, cov, identities, *, expected_doublet_rate=0.06, random_state=0,
@@ -346,10 +347,8 @@ def score_dna_doublets(mc, cov, identities, *, expected_doublet_rate=0.06, rando
 
 def run_dna_doublet_analysis(result_dir, dna_project_root, *, expected_doublet_rate=0.06,
                             random_state=0, doublet_threshold_scale=1.0):
-    """从同代 RawAdata 常染色体 1Mb mc/cov 分析全部 DNA，独立发布判定，不改变 RNA singlet 筛选。"""
+    """从同代常染色体 1 Mb mc/cov 分析全部 DNA，独立发布判定，不改变 RNA singlet 筛选。"""
     import importlib.metadata
-    import numpy as np
-    import snapatac2 as snap
 
     parent = Path(result_dir).expanduser().resolve()
     dna_root = Path(dna_project_root).expanduser().resolve()
@@ -363,17 +362,17 @@ def run_dna_doublet_analysis(result_dir, dna_project_root, *, expected_doublet_r
         raise DownstreamQCError('RNA 整合与当前 DNA 交付不一致')
     if _qc_snapshot_id(rna_root) != integration['rna_qc_snapshot_id']:
         raise DownstreamQCError('RNA 结果已改变，请重新运行整合')
-    identity, ids, regions = _dna_doublet_input(dna)
+    identity = _dna_doublet_input(dna)
     ledger_path = parent / 'DNA_RNA_cell_links.csv'
     if sha256_file(ledger_path) != integration['qc_artifacts']['DNA_RNA_cell_links.csv']:
         raise DownstreamQCError('RNA doublet 对应表已改变')
     versions = {name: importlib.metadata.version(name) for name in
-                ('ALLCools', 'snapatac2', 'numpy', 'pandas', 'scikit-learn', 'pynndescent', 'numba')}
-    provenance = dict(dna=integration['dna'], raw=identity,
+                ('ALLCools', 'numpy', 'pandas', 'scikit-learn', 'pynndescent', 'numba')}
+    provenance = dict(dna=integration['dna'], counts=identity,
                       integration_summary_sha256=hashlib.sha256(marker_bytes).hexdigest(),
                       integration_dir=str(parent), method='ALLCools.clustering.doublets.MethylScrublet',
                       bin_size=1000000, chromosomes='chr1-chr22 numeric autosomes present in reference',
-                      input_counts='RawAdata __values__: sum methylated counts / sum total coverage; no fraction matrix',
+                      input_counts='Alopex CpG: summed methylation and coverage integers per 1 Mb bin',
                       expected_doublet_rate=expected_doublet_rate, random_state=random_state,
                       sim_doublet_ratio=2.0, n_neighbors=10, stdev_doublet_rate=0.02, n_jobs=1,
                       doublet_threshold_scale=doublet_threshold_scale,
@@ -382,7 +381,7 @@ def run_dna_doublet_analysis(result_dir, dna_project_root, *, expected_doublet_r
                       versions=versions, processor_sha256=downstream_source_sha256())
 
     def check_inputs():
-        if (_dna_doublet_input(dna)[0] != identity
+        if (_dna_doublet_input(dna) != identity
                 or marker.read_bytes() != marker_bytes
                 or _qc_snapshot_id(rna_root) != integration['rna_qc_snapshot_id']
                 or sha256_file(ledger_path) != integration['qc_artifacts']['DNA_RNA_cell_links.csv']):
@@ -413,21 +412,9 @@ def run_dna_doublet_analysis(result_dir, dna_project_root, *, expected_doublet_r
                             'st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')):
                         raise DownstreamQCError('Cached DNA doublet scores changed during reuse; retry')
                     return out
-        print(f'DNA doublet：汇总 {len(ids)} cells × {len(regions)} 常染色体 1Mb 区域的 mc/cov', flush=True)
-        raw = snap.read(identity['source'], backed='r')
-        try:
-            matrices = [snap.pp.make_peak_matrix(raw, use_rep=regions, value_type=kind,
-                                                 summary_type='sum', inplace=False, chunk_size=500)
-                        for kind in ('target', 'total')]
-        finally:
-            raw.close()
-        if any(matrix.obs_names.astype(str).tolist() != ids.tolist() for matrix in matrices):
-            raise DownstreamQCError('区域计数改变 DNA cell ID 或顺序')
-        if matrices[0].var_names.tolist() != matrices[1].var_names.tolist():
-            raise DownstreamQCError('DNA mc/cov 区域不一致')
-        counts = [matrix.X.toarray() if hasattr(matrix.X, 'toarray') else np.asarray(matrix.X) for matrix in matrices]
+        mc, cov, ids = _load_dna_doublet_counts(dna, identity)
         identities = dna.set_index('Sample_ID').loc[ids].rename_axis('Sample_ID').reset_index()
-        scores, libraries = score_dna_doublets(*counts, identities, expected_doublet_rate=expected_doublet_rate,
+        scores, libraries = score_dna_doublets(mc, cov, identities, expected_doublet_rate=expected_doublet_rate,
                                              random_state=random_state, doublet_threshold_scale=doublet_threshold_scale)
         links = read_verified_qc_csv(
             ledger_path, integration['qc_artifacts'][ledger_path.name], dtype=str,
@@ -497,7 +484,7 @@ def export_droplet_single_cpg(result_dir, dna_project_root, *, dna_doublet_resul
                 raise DownstreamQCError('整合 QC 文件缺少有效哈希，请重新运行整合')
         if dna_doublet is not None:
             if (dna_marker.read_bytes() != dna_marker_bytes
-                    or _dna_doublet_input(dna)[0] != dna_doublet['raw']
+                    or _dna_doublet_input(dna) != dna_doublet['counts']
                     or sha256_file(destination / 'DNA_doublet_scores.csv')
                     != dna_doublet['artifacts']['DNA_doublet_scores.csv']):
                 raise DownstreamQCError('DNA doublet 输入/判定已改变，请重新运行 DNA 分析')
@@ -546,13 +533,12 @@ def export_droplet_single_cpg(result_dir, dna_project_root, *, dna_doublet_resul
     if (schema.get('input', {}).get('delivery_id') != provenance['delivery_id']
             or schema.get('h5ad') != signature):
         raise DownstreamQCError('SingleCpG 矩阵未绑定当前 DNA 交付或文件身份已改变')
-    generation = provenance.get('raw_generation')
-    if not isinstance(generation, str) or not generation or schema['input'].get('raw_generation') != generation:
-        raise DownstreamQCError('SingleCpG 的 RawAdata 代际与当前 DNA QC 完成凭证不一致')
-    if dna_doublet is not None and (
-            schema['input'].get('raw_generation') != dna_doublet['raw']['generation_id']
-            or schema['input'].get('raw_h5ad') != dna_doublet['raw']['source_identity']):
-        raise DownstreamQCError('SingleCpG 与 DNA doublet 使用不同 RawAdata 代际')
+    generation = provenance["cpg_generation"]
+    if (schema["input"].get("cpg_generation") != generation
+            or schema["input"].get("cpg_coordinate_base") != provenance["cpg_coordinate_base"]):
+        raise DownstreamQCError("SingleCpG 与 DNA QC 的 CpG 代际或坐标不一致")
+    if dna_doublet is not None and dna_doublet["counts"]["cpg_generation"] != generation:
+        raise DownstreamQCError("SingleCpG 与 DNA doublet 的 CpG 代际不一致")
     with h5py.File(source, 'r') as handle:
         obs = read_elem(handle['obs'])
     ids = obs.index.astype(str)

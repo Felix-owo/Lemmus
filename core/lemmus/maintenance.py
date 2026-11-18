@@ -187,7 +187,7 @@ def _check_environment_packages(prefix: Path, role: str, expected_subdir: str, s
         "anndata", "ipykernel", "jupyterlab", "numba", "numpy", "packaging", "pandas", "polars",
         "pyyaml", "scikit-learn", "seaborn", "tqdm", "jsonschema", "snakemake",
         "snakemake-executor-plugin-slurm", "pip", "pysam", "cutadapt", "multiqc", "awscli",
-        "leidenalg", "cykhash", "umi_tools", "macs3",
+        "leidenalg", "umi_tools",
     )}
     python_distributions.update({"matplotlib-base": "matplotlib", "python-igraph": "igraph"})
     def distribution_for(name):

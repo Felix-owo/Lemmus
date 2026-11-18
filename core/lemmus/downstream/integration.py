@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import re
 from decimal import Decimal, InvalidOperation
 from functools import partial
 from pathlib import Path
@@ -449,13 +450,19 @@ def load_dna_qc(dna_project_dir: Path, *, expected_reference: str | None = None)
         raise DownstreamQCError("Current DNA delivery has no completed downstream QC; run DNA downstream") from error
     if (not isinstance(identity, dict) or identity.get('delivery_id') != delivery
             or identity.get('snapshot_id') != delivery
-            or identity.get('run_manifest_sha256') != hashlib.sha256(marker_bytes).hexdigest()):
+            or identity.get('run_manifest_sha256') != hashlib.sha256(marker_bytes).hexdigest()
+            or not isinstance(identity.get('cpg_generation'), str)
+            or re.fullmatch(r'[0-9a-f]{32}', identity['cpg_generation']) is None):
         raise DownstreamQCError("Current DNA delivery disagrees with downstream QC completion; run DNA downstream")
     try:
         qc_state = _dna_input_state(qc_path)
         qc_bytes = qc_path.read_bytes()
     except OSError as error:
         raise DownstreamQCError(f"Current DNA delivery has no downstream QC table; run DNA downstream: {qc_path}") from error
+    coordinate_base = {"snapatac2_import_values_0based_v1": 0, "cpg_four_column_1based_v1": 1}.get(
+        identity.get("cpg_representation"))
+    if coordinate_base is None:
+        raise DownstreamQCError("DNA downstream has an unsupported CpG coordinate base")
     fields = _dna_table_header(qc_bytes, qc_path, ",")
     identity_columns = ("Sample_ID", "CloneID", "PlateID")
     missing = sorted(set(identity_columns) - set(fields))
@@ -488,7 +495,8 @@ def load_dna_qc(dna_project_dir: Path, *, expected_reference: str | None = None)
     dna_qc.attrs["dna_provenance"] = {
         "project_dir": str(root), "delivery_id": delivery, "run_manifest_sha256": hashlib.sha256(marker_bytes).hexdigest(),
         "qc_completion_sha256": hashlib.sha256(completion_bytes).hexdigest(),
-        "raw_generation": identity.get("raw_generation"),
+        "cpg_generation": identity["cpg_generation"], "cpg_coordinate_base": coordinate_base,
+        "doublet_counts": identity.get("doublet_counts"),
         "sealed_manifest_sha256": manifest_hash, "qc_path": str(qc_path), "qc_sha256": hashlib.sha256(qc_bytes).hexdigest(),
     }
     return dna_qc, manifest

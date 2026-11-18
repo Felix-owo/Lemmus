@@ -313,7 +313,7 @@ rna_darlin_setup_conda() (
   "$conda_bin" env create --solver libmamba --prefix "$atlas" --file "$setup/atlas.yaml" || return $?
   "$control/bin/python" -c 'import jsonschema, yaml' || return $?
   "$rules/bin/python" -c 'import anndata, hdf5plugin, numpy, pandas, pysam, yaml' || return $?
-  "$atlas/bin/python" -c 'import anndata, cellxgene_census, igraph, leidenalg, scanpy, scvi, sklearn, skimage, hdf5plugin, snapatac2; from ALLCools.clustering.doublets import MethylScrublet' || return $?
+  "$atlas/bin/python" -c 'import anndata, cellxgene_census, igraph, leidenalg, scanpy, scvi, sklearn, skimage, hdf5plugin; from ALLCools.clustering.doublets import MethylScrublet' || return $?
   local exe
   for exe in "${RNA_DARLIN_RULE_EXECUTABLES[@]}"; do [[ -x "$rules/$exe" ]] || { echo "ERROR: candidate missing $exe" >&2; return 1; }; done
   PATH="$rules/bin:$rules/lib/jvm/bin:$PATH" "$rules/bin/fastqc" --version >/dev/null || return $?
